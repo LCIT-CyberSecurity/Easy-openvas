@@ -81,7 +81,7 @@ printf '%s\n' "$*" >> "{log}"
 action=""
 for arg in "$@"; do
   case "$arg" in
-    config|up|ps) action="$arg" ;;
+    config|up|ps|inspect) action="$arg" ;;
   esac
 done
 if [[ "$action" == "config" ]]; then
@@ -93,6 +93,10 @@ fi
 if [[ "$action" == "ps" ]]; then
   echo mock-nginx
   exit {ps_exit}
+fi
+if [[ "$action" == "inspect" ]]; then
+  echo running
+  exit 0
 fi
 exit 0
 """
@@ -204,6 +208,20 @@ class CertificateInstallerTests(unittest.TestCase):
         result = run_installer("validate-certificate", cert, key, "openvas.client.fr", env=make_env(self.tmp_path))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("[OK] Certificate covers openvas.client.fr", result.stdout)
+
+    def test_wildcard_san_matches_only_one_label(self):
+        cert, key = generate_cert(self.tmp_path, "wildcard-depth", "DNS:*.client.fr")
+        result = run_installer(
+            "validate-certificate", cert, key, "nested.openvas.client.fr", env=make_env(self.tmp_path)
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Certificate does not cover nested.openvas.client.fr", result.stderr)
+
+    def test_certificate_without_dns_san_is_rejected(self):
+        cert, key = generate_cert(self.tmp_path, "cn-only", "IP:127.0.0.1")
+        result = run_installer("validate-certificate", cert, key, "openvas.client.fr", env=make_env(self.tmp_path))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Certificate does not contain a DNS Subject Alternative Name", result.stderr)
 
     def test_certificate_rejects_uncovered_fqdn(self):
         cert, key = generate_cert(self.tmp_path, "other", "DNS:other.client.fr")

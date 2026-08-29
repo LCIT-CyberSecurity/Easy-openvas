@@ -66,7 +66,10 @@ require_root() {
 
 resolve_path() {
   local input="$1"
-  realpath -- "$input"
+  if realpath -- "$input" 2>/dev/null; then
+    return 0
+  fi
+  realpath -m -- "$input"
 }
 
 prompt_path() {
@@ -114,6 +117,47 @@ cert_san() {
     | sed 's/[[:space:]]*$//'
 }
 
+cert_dns_names() {
+  local san entry
+  san="$(cert_san "$1")"
+  [[ -n "$san" ]] || return 0
+  tr ',' '\n' <<<"$san" | while IFS= read -r entry; do
+    entry="${entry#"${entry%%[![:space:]]*}"}"
+    entry="${entry%"${entry##*[![:space:]]}"}"
+    case "$entry" in
+      DNS:*) printf '%s\n' "${entry#DNS:}" ;;
+    esac
+  done
+}
+
+cert_has_dns_san() {
+  local cert="$1"
+  [[ -n "$(cert_dns_names "$cert" | head -n 1)" ]]
+}
+
+hostname_matches_dns_san() {
+  local fqdn="${1,,}"
+  local san="${2,,}"
+  local suffix prefix remainder
+
+  if [[ "$san" == "$fqdn" ]]; then
+    return 0
+  fi
+
+  case "$san" in
+    "*."*)
+      suffix="${san#\*.}"
+      [[ "$fqdn" == *."$suffix" ]] || return 1
+      prefix="${fqdn%."$suffix"}"
+      remainder="${prefix%.}"
+      [[ -n "$remainder" && "$remainder" != *.* ]]
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 date_epoch() {
   date -d "$1" +%s
 }
@@ -145,7 +189,43 @@ cert_key_match() {
 cert_covers_fqdn() {
   local cert="$1"
   local fqdn="$2"
-  "$OPENSSL_CMD" x509 -in "$cert" -noout -checkhost "$fqdn" 2>/dev/null | grep -q "does match"
+  local san
+  while IFS= read -r san; do
+    if hostname_matches_dns_san "$fqdn" "$san"; then
+      return 0
+    fi
+  done < <(cert_dns_names "$cert")
+  return 1
+}
+
+cert_is_self_signed() {
+  local cert="$1"
+  local subject issuer
+  subject="$(cert_subject "$cert")"
+  issuer="$(cert_issuer "$cert")"
+  [[ "$subject" == "$issuer" ]] && openssl_quiet verify -CAfile "$cert" "$cert"
+}
+
+pem_certificate_count() {
+  grep -c -- '-----BEGIN CERTIFICATE-----' "$1" || true
+}
+
+warn_if_fullchain_may_be_incomplete() {
+  local cert="$1"
+  local count
+  count="$(pem_certificate_count "$cert")"
+  if (( count <= 1 )) && ! cert_is_self_signed "$cert"; then
+    warning "The supplied certificate file contains only one certificate."
+    warning "Make sure the required intermediate CA certificates are included."
+  fi
+}
+
+cert_not_before_valid() {
+  local cert="$1"
+  local start_epoch now_epoch
+  start_epoch="$(date_epoch "$(cert_start "$cert")")"
+  now_epoch="$(date +%s)"
+  (( start_epoch <= now_epoch ))
 }
 
 print_certificate_info() {
@@ -174,14 +254,14 @@ validate_certificate_files() {
   if file_readable_regular "$cert"; then
     ok "Certificate file found"
   else
-    die_no_change "Certificate file not found or not readable."
+    die_no_change "Certificate file not found: $cert"
     return 1
   fi
 
   if file_readable_regular "$key"; then
     ok "Private key file found"
   else
-    die_no_change "Private key file not found or not readable."
+    die_no_change "Private key file not found: $key"
     return 1
   fi
 
@@ -206,10 +286,24 @@ validate_certificate_files() {
     return 1
   fi
 
+  if cert_not_before_valid "$cert"; then
+    ok "Certificate is already valid"
+  else
+    die_no_change "Certificate is not valid yet."
+    return 1
+  fi
+
   if openssl_quiet x509 -in "$cert" -checkend 0 -noout; then
     ok "Certificate is not expired"
   else
     die_no_change "Certificate has expired."
+    return 1
+  fi
+
+  if cert_has_dns_san "$cert"; then
+    ok "Certificate contains DNS Subject Alternative Name"
+  else
+    die_no_change "Certificate does not contain a DNS Subject Alternative Name."
     return 1
   fi
 
@@ -220,6 +314,7 @@ validate_certificate_files() {
     return 1
   fi
 
+  warn_if_fullchain_may_be_incomplete "$cert"
   print_certificate_info "$cert"
   remaining="$(days_remaining "$(cert_end "$cert")")"
   if (( remaining < 30 )); then
@@ -293,13 +388,17 @@ validate_compose_quiet() {
 create_backup() {
   info "Creating configuration backup..."
   rm -rf -- "$BACKUP_DIR"
-  mkdir -p -- "$BACKUP_DIR"
+  mkdir -m 700 -p -- "$BACKUP_DIR"
+  chmod 700 "$BACKUP_DIR"
   cp -- "$COMPOSE_FILE" "$BACKUP_DIR/compose.yaml"
+  chmod 600 "$BACKUP_DIR/compose.yaml"
   if [[ -f "$CERT_DEST" ]]; then
     cp -- "$CERT_DEST" "$BACKUP_DIR/server.cert.pem"
+    chmod 600 "$BACKUP_DIR/server.cert.pem"
   fi
   if [[ -f "$KEY_DEST" ]]; then
     cp -- "$KEY_DEST" "$BACKUP_DIR/server.key"
+    chmod 600 "$BACKUP_DIR/server.key"
   fi
   ok "Backup created"
 }
@@ -451,12 +550,20 @@ validate_compose_or_rollback() {
   return 1
 }
 
+is_nginx_running() {
+  local container_id status
+  container_id="$(cd "$OPENVAS_DIR" && "$DOCKER_CMD" compose -f "$COMPOSE_FILE" ps -q nginx 2>/dev/null | head -n 1)"
+  [[ -n "$container_id" ]] || return 1
+  status="$($DOCKER_CMD inspect --format='{{.State.Status}}' "$container_id" 2>/dev/null || true)"
+  [[ "$status" == "running" ]]
+}
+
 reload_tls_services() {
   info "Reloading Greenbone TLS services..."
   if ! (cd "$OPENVAS_DIR" && "$DOCKER_CMD" compose -f "$COMPOSE_FILE" up -d gvm-config nginx >/dev/null); then
     return 1
   fi
-  if (cd "$OPENVAS_DIR" && "$DOCKER_CMD" compose -f "$COMPOSE_FILE" ps -q nginx >/dev/null); then
+  if is_nginx_running; then
     ok "nginx is running"
   else
     return 1
@@ -483,6 +590,26 @@ https_endpoint_reachable() {
   openssl_quiet x509 -in "$tmp" -noout
 }
 
+wait_for_https_certificate() {
+  local fqdn="$1"
+  local output="$2"
+  local attempts="${EASY_OPENVAS_HTTPS_RETRIES:-10}"
+  local delay="${EASY_OPENVAS_HTTPS_RETRY_DELAY:-2}"
+  local attempt
+  info "Waiting for HTTPS endpoint..."
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    if retrieve_presented_certificate "$output" "$fqdn" && openssl_quiet x509 -in "$output" -noout; then
+      ok "HTTPS endpoint reachable"
+      return 0
+    fi
+    if (( attempt < attempts )); then
+      sleep "$delay"
+    fi
+  done
+  error "HTTPS endpoint did not become ready."
+  return 1
+}
+
 post_install_checks() {
   local fqdn="$1"
   local expected_cert="$2"
@@ -491,16 +618,14 @@ post_install_checks() {
 Post-installation checks
 
 '
-  if (cd "$OPENVAS_DIR" && "$DOCKER_CMD" compose -f "$COMPOSE_FILE" ps -q nginx >/dev/null); then
+  if is_nginx_running; then
     ok "nginx container running"
   else
     return 1
   fi
   presented="$(mktemp)"
   TMP_FILES+=("$presented")
-  if retrieve_presented_certificate "$presented" "$fqdn"; then
-    ok "HTTPS endpoint reachable"
-  else
+  if ! wait_for_https_certificate "$fqdn" "$presented"; then
     return 1
   fi
   if openssl_quiet x509 -in "$presented" -noout; then
