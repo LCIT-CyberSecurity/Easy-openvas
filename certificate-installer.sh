@@ -14,40 +14,23 @@ HTTPS_CERT_CMD="${EASY_OPENVAS_HTTPS_CERT_CMD:-}"
 TLS_HOST="${EASY_OPENVAS_TLS_HOST:-127.0.0.1}"
 TLS_PORT="${EASY_OPENVAS_TLS_PORT:-443}"
 SKIP_ROOT_CHECK="${EASY_OPENVAS_SKIP_ROOT:-false}"
-TEST_MODE="${EASY_OPENVAS_TEST_MODE:-false}"
-
-RED=""
-GREEN=""
-YELLOW=""
-BLUE=""
-RESET=""
-if [[ -t 1 && "${NO_COLOR:-}" == "" ]]; then
-  RED=$'\033[31m'
-  GREEN=$'\033[32m'
-  YELLOW=$'\033[33m'
-  BLUE=$'\033[34m'
-  RESET=$'\033[0m'
-fi
 
 TMP_FILES=()
-
 cleanup_tmp() {
   local path
   for path in "${TMP_FILES[@]:-}"; do
-    if [[ -n "$path" && -e "$path" ]]; then
-      rm -f -- "$path"
-    fi
+    [[ -n "$path" && -e "$path" ]] && rm -f -- "$path"
   done
   return 0
 }
 trap cleanup_tmp EXIT
 
-info() { printf '%s[INFO]%s %s\n' "$BLUE" "$RESET" "$*"; }
-ok() { printf '%s[OK]%s %s\n' "$GREEN" "$RESET" "$*"; }
-warning() { printf '%s[WARNING]%s %s\n' "$YELLOW" "$RESET" "$*"; }
-error() { printf '%s[ERROR]%s %s\n' "$RED" "$RESET" "$*" >&2; }
+info() { printf '[INFO] %s\n' "$*"; }
+ok() { printf '[OK] %s\n' "$*"; }
+warning() { printf '[WARNING] %s\n' "$*"; }
+error() { printf '[ERROR] %s\n' "$*" >&2; }
 
-die_no_change() {
+no_change() {
   error "$1"
   printf 'No configuration has been changed.\n' >&2
   return 1
@@ -66,43 +49,32 @@ require_root() {
 
 resolve_path() {
   local input="$1"
-  if realpath -- "$input" 2>/dev/null; then
-    return 0
-  fi
-  realpath -m -- "$input"
+  realpath -- "$input" 2>/dev/null || realpath -m -- "$input"
 }
 
 prompt_path() {
-  local label="$1"
-  local value
+  local label="$1" value
   printf '%s\n> ' "$label" >&2
   IFS= read -r value
   resolve_path "$value"
 }
 
 prompt_value() {
-  local label="$1"
-  local value
+  local label="$1" value
   printf '%s\n> ' "$label" >&2
   IFS= read -r value
   printf '%s' "$value"
 }
 
 confirm() {
-  local prompt="$1"
   local answer
-  printf '%s ' "$prompt"
+  printf '%s ' "$1"
   IFS= read -r answer
   [[ "$answer" == "y" || "$answer" == "Y" || "$answer" == "yes" || "$answer" == "YES" ]]
 }
 
-openssl_quiet() {
+openssl_ok() {
   "$OPENSSL_CMD" "$@" >/dev/null 2>&1
-}
-
-file_readable_regular() {
-  local path="$1"
-  [[ -f "$path" && -r "$path" ]]
 }
 
 cert_subject() { "$OPENSSL_CMD" x509 -in "$1" -noout -subject 2>/dev/null | sed 's/^subject=//'; }
@@ -114,58 +86,44 @@ cert_san() {
   "$OPENSSL_CMD" x509 -in "$1" -noout -ext subjectAltName 2>/dev/null \
     | awk 'NR > 1 { gsub(/^ +| +$/, ""); print }' \
     | tr '\n' ' ' \
-    | sed 's/[[:space:]]*$//'
+    | sed 's/[[:space:]]*$//' \
+    || true
 }
 
 cert_dns_names() {
-  local san entry
+  local entry san
   san="$(cert_san "$1")"
   [[ -n "$san" ]] || return 0
   tr ',' '\n' <<<"$san" | while IFS= read -r entry; do
     entry="${entry#"${entry%%[![:space:]]*}"}"
     entry="${entry%"${entry##*[![:space:]]}"}"
-    case "$entry" in
-      DNS:*) printf '%s\n' "${entry#DNS:}" ;;
-    esac
+    [[ "$entry" == DNS:* ]] && printf '%s\n' "${entry#DNS:}"
   done
 }
 
-cert_has_dns_san() {
-  local cert="$1"
-  [[ -n "$(cert_dns_names "$cert" | head -n 1)" ]]
-}
-
 hostname_matches_dns_san() {
-  local fqdn="${1,,}"
-  local san="${2,,}"
-  local suffix prefix remainder
-
-  if [[ "$san" == "$fqdn" ]]; then
-    return 0
-  fi
-
-  case "$san" in
-    "*."*)
-      suffix="${san#\*.}"
-      [[ "$fqdn" == *."$suffix" ]] || return 1
-      prefix="${fqdn%."$suffix"}"
-      remainder="${prefix%.}"
-      [[ -n "$remainder" && "$remainder" != *.* ]]
-      ;;
-    *)
-      return 1
-      ;;
-  esac
+  local fqdn="${1,,}" san="${2,,}" suffix prefix
+  [[ "$fqdn" == "$san" ]] && return 0
+  [[ "$san" == \*.* ]] || return 1
+  suffix="${san#\*.}"
+  [[ "$fqdn" == *."$suffix" ]] || return 1
+  prefix="${fqdn%."$suffix"}"
+  [[ -n "$prefix" && "$prefix" != *.* ]]
 }
 
-date_epoch() {
-  date -d "$1" +%s
+cert_covers_fqdn() {
+  local cert="$1" fqdn="$2" san
+  while IFS= read -r san; do
+    hostname_matches_dns_san "$fqdn" "$san" && return 0
+  done < <(cert_dns_names "$cert")
+  return 1
 }
+
+date_epoch() { date -d "$1" +%s; }
 
 days_remaining() {
-  local end_date="$1"
   local end_epoch now_epoch
-  end_epoch="$(date_epoch "$end_date")"
+  end_epoch="$(date_epoch "$(cert_end "$1")")"
   now_epoch="$(date +%s)"
   printf '%s\n' $(((end_epoch - now_epoch) / 86400))
 }
@@ -175,9 +133,7 @@ cert_fingerprint() {
 }
 
 cert_key_match() {
-  local cert="$1"
-  local key="$2"
-  local cert_pub key_pub
+  local cert="$1" key="$2" cert_pub key_pub
   cert_pub="$(mktemp)"
   key_pub="$(mktemp)"
   TMP_FILES+=("$cert_pub" "$key_pub")
@@ -186,216 +142,140 @@ cert_key_match() {
   cmp -s "$cert_pub" "$key_pub"
 }
 
-cert_covers_fqdn() {
-  local cert="$1"
-  local fqdn="$2"
-  local san
-  while IFS= read -r san; do
-    if hostname_matches_dns_san "$fqdn" "$san"; then
-      return 0
-    fi
-  done < <(cert_dns_names "$cert")
-  return 1
-}
-
 cert_is_self_signed() {
   local cert="$1"
-  local subject issuer
-  subject="$(cert_subject "$cert")"
-  issuer="$(cert_issuer "$cert")"
-  [[ "$subject" == "$issuer" ]] && openssl_quiet verify -CAfile "$cert" "$cert"
+  [[ "$(cert_subject "$cert")" == "$(cert_issuer "$cert")" ]] && openssl_ok verify -CAfile "$cert" "$cert"
 }
 
-pem_certificate_count() {
-  grep -c -- '-----BEGIN CERTIFICATE-----' "$1" || true
-}
-
-warn_if_fullchain_may_be_incomplete() {
-  local cert="$1"
+warn_if_single_non_self_signed_cert() {
   local count
-  count="$(pem_certificate_count "$cert")"
-  if (( count <= 1 )) && ! cert_is_self_signed "$cert"; then
+  count="$(grep -c -- '-----BEGIN CERTIFICATE-----' "$1" || true)"
+  if (( count <= 1 )) && ! cert_is_self_signed "$1"; then
     warning "The supplied certificate file contains only one certificate."
-    warning "Make sure the required intermediate CA certificates are included."
+    warning "Make sure required intermediate CA certificates are included."
   fi
 }
 
-cert_not_before_valid() {
-  local cert="$1"
-  local start_epoch now_epoch
-  start_epoch="$(date_epoch "$(cert_start "$cert")")"
-  now_epoch="$(date +%s)"
-  (( start_epoch <= now_epoch ))
-}
-
-print_certificate_info() {
-  local cert="$1"
-  local end_date remaining san
-  end_date="$(cert_end "$cert")"
-  remaining="$(days_remaining "$end_date")"
+print_certificate_block() {
+  local title="$1" cert="$2" remaining san
+  remaining="$(days_remaining "$cert")"
   san="$(cert_san "$cert")"
-  printf '\nCertificate information\n\n'
+  printf '\n%s\n\n' "$title"
   printf 'Subject............. %s\n' "$(cert_subject "$cert")"
   printf 'Issuer.............. %s\n' "$(cert_issuer "$cert")"
   printf 'Valid from.......... %s\n' "$(cert_start "$cert")"
-  printf 'Valid until......... %s\n' "$end_date"
+  printf 'Valid until......... %s\n' "$(cert_end "$cert")"
   printf 'Days remaining...... %s\n' "$remaining"
   printf 'SAN................. %s\n' "${san:-Not present}"
 }
 
 validate_certificate_files() {
-  local cert="$1"
-  local key="$2"
-  local fqdn="$3"
-  local remaining
-
-  printf 'Checking certificate...\n\n'
-
-  if file_readable_regular "$cert"; then
-    ok "Certificate file found"
+  local cert="$1" key="$2" fqdn="$3" remaining
+  if [[ -f "$cert" && -r "$cert" ]]; then
+    ok "Certificate found"
   else
-    die_no_change "Certificate file not found: $cert"
+    no_change "Certificate not found or not readable: $cert"
     return 1
   fi
-
-  if file_readable_regular "$key"; then
-    ok "Private key file found"
+  if [[ -f "$key" && -r "$key" ]]; then
+    ok "Private key found"
   else
-    die_no_change "Private key file not found: $key"
+    no_change "Private key not found or not readable: $key"
     return 1
   fi
-
-  if openssl_quiet x509 -in "$cert" -noout; then
-    ok "Certificate PEM format valid"
+  if openssl_ok x509 -in "$cert" -noout; then
+    ok "Certificate valid"
   else
-    die_no_change "Certificate PEM format invalid."
+    no_change "Certificate PEM format invalid."
     return 1
   fi
-
-  if openssl_quiet pkey -in "$key" -noout; then
-    ok "Private key format valid"
+  if openssl_ok pkey -in "$key" -noout; then
+    ok "Private key valid"
   else
-    die_no_change "Private key format invalid."
+    no_change "Private key format invalid."
     return 1
   fi
-
   if cert_key_match "$cert" "$key"; then
-    ok "Certificate and private key match"
+    ok "Certificate/private key match"
   else
-    die_no_change "Certificate and private key do not match."
+    no_change "Certificate and private key do not match."
     return 1
   fi
-
-  if cert_not_before_valid "$cert"; then
-    ok "Certificate is already valid"
-  else
-    die_no_change "Certificate is not valid yet."
+  if (( $(date_epoch "$(cert_start "$cert")") > $(date +%s) )); then
+    no_change "Certificate is not valid yet."
     return 1
   fi
-
-  if openssl_quiet x509 -in "$cert" -checkend 0 -noout; then
-    ok "Certificate is not expired"
-  else
-    die_no_change "Certificate has expired."
+  if ! openssl_ok x509 -in "$cert" -checkend 0 -noout; then
+    no_change "Certificate has expired."
     return 1
   fi
-
-  if cert_has_dns_san "$cert"; then
-    ok "Certificate contains DNS Subject Alternative Name"
-  else
-    die_no_change "Certificate does not contain a DNS Subject Alternative Name."
+  if [[ -z "$(cert_dns_names "$cert" | head -n 1)" ]]; then
+    no_change "Certificate does not contain a DNS Subject Alternative Name."
     return 1
   fi
-
   if cert_covers_fqdn "$cert" "$fqdn"; then
-    ok "Certificate covers $fqdn"
+    ok "Certificate valid for $fqdn"
   else
-    die_no_change "Certificate does not cover $fqdn."
+    no_change "Certificate does not cover $fqdn."
     return 1
   fi
-
-  warn_if_fullchain_may_be_incomplete "$cert"
-  print_certificate_info "$cert"
-  remaining="$(days_remaining "$(cert_end "$cert")")"
-  if (( remaining < 30 )); then
-    warning "Certificate expires in $remaining days."
-  fi
+  warn_if_single_non_self_signed_cert "$cert"
+  print_certificate_block "Certificate information" "$cert"
+  remaining="$(days_remaining "$cert")"
+  (( remaining < 30 )) && warning "Certificate expires in $remaining days."
+  return 0
 }
 
-service_exists_in_compose() {
-  local service="$1"
-  awk -v svc="$service" '
-    $0 ~ "^  " svc ":$" { found=1 }
+service_exists() {
+  awk -v svc="$1" '$0 ~ "^  " svc ":$" { found=1 } END { exit found ? 0 : 1 }' "$COMPOSE_FILE"
+}
+
+compose_mount_counts() {
+  awk '
+    /^  nginx:$/ { svc="nginx"; next }
+    /^  [A-Za-z0-9_-]+:$/ { svc="" }
+    svc=="nginx" && /^[[:space:]]*-[[:space:]]+nginx_certificates_vol:\/etc\/nginx\/certs:ro/ { green++ }
+    svc=="nginx" && /^[[:space:]]*-[[:space:]]+\/[^#]*\/certs:\/etc\/nginx\/certs:ro/ { custom++ }
+    END { printf "%d %d\n", green, custom }
+  ' "$COMPOSE_FILE"
+}
+
+compose_has_managed_mount() {
+  awk '
+    /^  nginx:$/ { svc="nginx"; next }
+    /^  [A-Za-z0-9_-]+:$/ { svc="" }
+    svc=="nginx" && /nginx_certificates_vol:\/etc\/nginx\/certs:ro/ { found=1 }
+    svc=="nginx" && /\/certs:\/etc\/nginx\/certs:ro/ { found=1 }
     END { exit found ? 0 : 1 }
   ' "$COMPOSE_FILE"
 }
 
-compose_has_tls_structure() {
-  awk '
-    /^  gvm-config:$/ { svc="gvm-config"; next }
-    /^  nginx:$/ { svc="nginx"; next }
-    /^  [A-Za-z0-9_-]+:$/ { svc="" }
-    svc=="gvm-config" && /ENABLE_TLS_GENERATION:[[:space:]]*(true|false)/ { tls=1 }
-    svc=="nginx" && /nginx_certificates_vol:\/etc\/nginx\/certs:ro/ { certvol=1 }
-    svc=="nginx" && /\/etc\/nginx\/certs\/server\.cert\.pem:ro/ { certfile=1 }
-    svc=="nginx" && /\/etc\/nginx\/certs\/server\.key:ro/ { keyfile=1 }
-    END { exit (tls && (certvol || (certfile && keyfile))) ? 0 : 1 }
-  ' "$COMPOSE_FILE"
+validate_compose_structure() {
+  local green custom
+  if [[ ! -f "$COMPOSE_FILE" ]]; then
+    no_change "Unsupported Greenbone Compose structure."
+    return 1
+  fi
+  service_exists nginx || { no_change "Unsupported Greenbone Compose structure."; return 1; }
+  compose_has_managed_mount || { no_change "Unsupported Greenbone Compose structure."; return 1; }
+  read -r green custom < <(compose_mount_counts)
+  if (( green + custom != 1 )); then
+    no_change "Unsupported Greenbone Compose structure."
+    return 1
+  fi
 }
 
-validate_easy_openvas_installation() {
-  printf 'Checking Easy-OpenVAS installation...\n\n'
-  if [[ -f "$COMPOSE_FILE" ]]; then
-    ok "$COMPOSE_FILE found"
-  else
-    error "Unsupported Greenbone Compose structure."
-    printf 'No changes have been made.\n' >&2
-    return 1
-  fi
-
-  if service_exists_in_compose "nginx"; then
-    ok "nginx service found"
-  else
-    error "Unsupported Greenbone Compose structure."
-    printf 'No changes have been made.\n' >&2
-    return 1
-  fi
-
-  if service_exists_in_compose "gvm-config"; then
-    ok "gvm-config service found"
-  else
-    error "Unsupported Greenbone Compose structure."
-    printf 'No changes have been made.\n' >&2
-    return 1
-  fi
-
-  if compose_has_tls_structure; then
-    ok "Greenbone TLS structure found"
-  else
-    error "Unsupported Greenbone Compose structure."
-    printf 'No changes have been made.\n' >&2
-    return 1
-  fi
-
-  validate_compose_quiet
-  ok "Docker Compose configuration valid"
-}
-
-validate_compose_quiet() {
+docker_compose_config() {
   (cd "$OPENVAS_DIR" && "$DOCKER_CMD" compose -f "$COMPOSE_FILE" config >/dev/null)
 }
 
 create_backup() {
-  info "Creating configuration backup..."
+  info "Creating rollback backup..."
   rm -rf -- "$BACKUP_DIR"
-  mkdir -m 700 -p -- "$BACKUP_DIR"
+  mkdir -p -- "$BACKUP_DIR"
   chmod 700 "$BACKUP_DIR"
   cp -- "$COMPOSE_FILE" "$BACKUP_DIR/compose.yaml"
-  chmod 600 "$BACKUP_DIR/compose.yaml"
-  if [[ -f "$CERT_DEST" ]]; then
-    cp -- "$CERT_DEST" "$BACKUP_DIR/server.cert.pem"
-    chmod 600 "$BACKUP_DIR/server.cert.pem"
-  fi
+  [[ -f "$CERT_DEST" ]] && cp -- "$CERT_DEST" "$BACKUP_DIR/server.cert.pem"
   if [[ -f "$KEY_DEST" ]]; then
     cp -- "$KEY_DEST" "$BACKUP_DIR/server.key"
     chmod 600 "$BACKUP_DIR/server.key"
@@ -405,9 +285,7 @@ create_backup() {
 
 restore_backup() {
   info "Restoring previous configuration..."
-  if [[ -f "$BACKUP_DIR/compose.yaml" ]]; then
-    cp -- "$BACKUP_DIR/compose.yaml" "$COMPOSE_FILE"
-  fi
+  cp -- "$BACKUP_DIR/compose.yaml" "$COMPOSE_FILE"
   mkdir -p -- "$CERTS_DIR"
   if [[ -f "$BACKUP_DIR/server.cert.pem" ]]; then
     cp -- "$BACKUP_DIR/server.cert.pem" "$CERT_DEST"
@@ -424,155 +302,72 @@ restore_backup() {
   ok "Rollback completed."
 }
 
-secure_copy_certificate() {
-  local cert="$1"
-  local key="$2"
-  local tmp_cert tmp_key
+copy_certificate() {
+  local cert="$1" key="$2" tmp_cert tmp_key
   mkdir -p -- "$CERTS_DIR"
   chown root:root "$CERTS_DIR" 2>/dev/null || true
   chmod 700 "$CERTS_DIR"
-
   tmp_cert="$(mktemp "$CERTS_DIR/.server.cert.pem.XXXXXX")"
   tmp_key="$(mktemp "$CERTS_DIR/.server.key.XXXXXX")"
   TMP_FILES+=("$tmp_cert" "$tmp_key")
-
   cp -- "$cert" "$tmp_cert"
   cp -- "$key" "$tmp_key"
+  chown root:root "$tmp_cert" "$tmp_key" 2>/dev/null || true
   chmod 644 "$tmp_cert"
   chmod 600 "$tmp_key"
-  chown root:root "$tmp_cert" "$tmp_key" 2>/dev/null || true
   mv -f -- "$tmp_cert" "$CERT_DEST"
   mv -f -- "$tmp_key" "$KEY_DEST"
+  return 0
 }
 
-render_custom_compose() {
-  local output="$1"
-  awk -v cert="$CERT_DEST" -v key="$KEY_DEST" '
-    function emit_custom() {
-      if (!custom_emitted) {
-        print "      - " cert ":/etc/nginx/certs/server.cert.pem:ro"
-        print "      - " key ":/etc/nginx/certs/server.key:ro"
-        custom_emitted=1
-      }
-    }
-    /^  [A-Za-z0-9_-]+:$/ {
-      if (svc=="nginx" && section=="volumes") emit_custom()
-      svc=$0
-      sub(/^  /, "", svc)
-      sub(/:$/, "", svc)
-      section=""
-      custom_emitted=0
-      print
-      next
-    }
-    /^    [A-Za-z0-9_-]+:$/ {
-      if (svc=="nginx" && section=="volumes") emit_custom()
-      section=$0
-      sub(/^    /, "", section)
-      sub(/:$/, "", section)
-      print
-      next
-    }
-    svc=="gvm-config" && $0 ~ /^[[:space:]]+ENABLE_TLS_GENERATION:/ {
-      print "      ENABLE_TLS_GENERATION: false"
-      next
-    }
-    svc=="nginx" && section=="volumes" && $0 ~ /\/etc\/nginx\/certs(:ro)?$/ { next }
-    svc=="nginx" && section=="volumes" && $0 ~ /\/etc\/nginx\/certs\/server\.cert\.pem:ro$/ { next }
-    svc=="nginx" && section=="volumes" && $0 ~ /\/etc\/nginx\/certs\/server\.key:ro$/ { next }
-    svc=="nginx" && section=="volumes" && $0 ~ /gsa_data_vol:\/usr\/share\/nginx\/html:ro/ { emit_custom(); print; next }
-    { print }
-    END { if (svc=="nginx" && section=="volumes") emit_custom() }
-  ' "$COMPOSE_FILE" >"$output"
-}
-
-render_self_signed_compose() {
-  local output="$1"
-  awk '
-    function emit_certvol() {
-      if (!certvol_emitted) {
-        print "      - nginx_certificates_vol:/etc/nginx/certs:ro"
-        certvol_emitted=1
-      }
-    }
-    /^  [A-Za-z0-9_-]+:$/ {
-      if (svc=="nginx" && section=="volumes") emit_certvol()
-      svc=$0
-      sub(/^  /, "", svc)
-      sub(/:$/, "", svc)
-      section=""
-      certvol_emitted=0
-      print
-      next
-    }
-    /^    [A-Za-z0-9_-]+:$/ {
-      if (svc=="nginx" && section=="volumes") emit_certvol()
-      section=$0
-      sub(/^    /, "", section)
-      sub(/:$/, "", section)
-      print
-      next
-    }
-    svc=="gvm-config" && $0 ~ /^[[:space:]]+ENABLE_TLS_GENERATION:/ {
-      print "      ENABLE_TLS_GENERATION: true"
-      next
-    }
-    svc=="nginx" && section=="volumes" && $0 ~ /\/etc\/nginx\/certs\/server\.cert\.pem:ro$/ { next }
-    svc=="nginx" && section=="volumes" && $0 ~ /\/etc\/nginx\/certs\/server\.key:ro$/ { next }
-    svc=="nginx" && section=="volumes" && $0 ~ /nginx_certificates_vol:\/etc\/nginx\/certs:ro/ { certvol_emitted=1; print; next }
-    svc=="nginx" && section=="volumes" && $0 ~ /gsa_data_vol:\/usr\/share\/nginx\/html:ro/ { emit_certvol(); print; next }
-    { print }
-    END { if (svc=="nginx" && section=="volumes") emit_certvol() }
-  ' "$COMPOSE_FILE" >"$output"
-}
-
-apply_compose_file() {
-  local mode="$1"
-  local tmp
+switch_compose_mount() {
+  local mode="$1" tmp
   tmp="$(mktemp)"
   TMP_FILES+=("$tmp")
-  if [[ "$mode" == "custom" ]]; then
-    render_custom_compose "$tmp"
-  else
-    render_self_signed_compose "$tmp"
-  fi
+  awk -v mode="$mode" -v certs="$CERTS_DIR" '
+    function emit_block() {
+      if (emitted) return
+      print "      # Greenbone default self-signed certificate:"
+      if (mode == "self-signed") print "      - nginx_certificates_vol:/etc/nginx/certs:ro"
+      else print "      # - nginx_certificates_vol:/etc/nginx/certs:ro"
+      print ""
+      print "      # Easy-OpenVAS custom certificate:"
+      if (mode == "custom") print "      - " certs ":/etc/nginx/certs:ro"
+      else print "      # - " certs ":/etc/nginx/certs:ro"
+      emitted=1
+    }
+    /^  nginx:$/ { svc="nginx"; print; next }
+    /^  [A-Za-z0-9_-]+:$/ {
+      if (svc=="nginx" && !emitted) emit_block()
+      svc=""
+      print
+      next
+    }
+    svc=="nginx" && /^[[:space:]]*#?[[:space:]]*Greenbone default self-signed certificate:/ { emit_block(); next }
+    svc=="nginx" && /^[[:space:]]*#?[[:space:]]*Easy-OpenVAS custom certificate:/ { next }
+    svc=="nginx" && /nginx_certificates_vol:\/etc\/nginx\/certs:ro/ { emit_block(); next }
+    svc=="nginx" && /\/certs:\/etc\/nginx\/certs:ro/ { emit_block(); next }
+    { print }
+    END { if (svc=="nginx" && !emitted) emit_block() }
+  ' "$COMPOSE_FILE" >"$tmp"
   mv -f -- "$tmp" "$COMPOSE_FILE"
+  return 0
 }
 
-validate_compose_or_rollback() {
-  info "Validating Docker Compose configuration..."
-  if validate_compose_quiet; then
-    ok "Docker Compose configuration valid"
-    return 0
-  fi
-  error "Docker Compose configuration invalid."
-  restore_backup
-  return 1
+recreate_nginx() {
+  (cd "$OPENVAS_DIR" && "$DOCKER_CMD" compose -f "$COMPOSE_FILE" up -d --force-recreate nginx >/dev/null)
 }
 
-is_nginx_running() {
-  local container_id status
-  container_id="$(cd "$OPENVAS_DIR" && "$DOCKER_CMD" compose -f "$COMPOSE_FILE" ps -q nginx 2>/dev/null | head -n 1)"
-  [[ -n "$container_id" ]] || return 1
-  status="$($DOCKER_CMD inspect --format='{{.State.Status}}' "$container_id" 2>/dev/null || true)"
+nginx_running() {
+  local id status
+  id="$(cd "$OPENVAS_DIR" && "$DOCKER_CMD" compose -f "$COMPOSE_FILE" ps -q nginx 2>/dev/null | head -n 1)"
+  [[ -n "$id" ]] || return 1
+  status="$($DOCKER_CMD inspect --format='{{.State.Status}}' "$id" 2>/dev/null || true)"
   [[ "$status" == "running" ]]
 }
 
-reload_tls_services() {
-  info "Reloading Greenbone TLS services..."
-  if ! (cd "$OPENVAS_DIR" && "$DOCKER_CMD" compose -f "$COMPOSE_FILE" up -d gvm-config nginx >/dev/null); then
-    return 1
-  fi
-  if is_nginx_running; then
-    ok "nginx is running"
-  else
-    return 1
-  fi
-}
-
 retrieve_presented_certificate() {
-  local output="$1"
-  local fqdn="$2"
+  local output="$1" fqdn="$2"
   if [[ -n "$HTTPS_CERT_CMD" ]]; then
     EASY_OPENVAS_CERT_OUTPUT="$output" EASY_OPENVAS_FQDN="$fqdn" bash -c "$HTTPS_CERT_CMD"
     return
@@ -581,80 +376,43 @@ retrieve_presented_certificate() {
     | "$OPENSSL_CMD" x509 -outform PEM >"$output"
 }
 
-https_endpoint_reachable() {
-  local fqdn="$1"
-  local tmp
-  tmp="$(mktemp)"
-  TMP_FILES+=("$tmp")
-  retrieve_presented_certificate "$tmp" "$fqdn"
-  openssl_quiet x509 -in "$tmp" -noout
-}
-
-wait_for_https_certificate() {
-  local fqdn="$1"
-  local output="$2"
-  local attempts="${EASY_OPENVAS_HTTPS_RETRIES:-10}"
-  local delay="${EASY_OPENVAS_HTTPS_RETRY_DELAY:-2}"
-  local attempt
-  info "Waiting for HTTPS endpoint..."
+wait_for_https() {
+  local fqdn="$1" output="$2" attempt attempts delay
+  attempts="${EASY_OPENVAS_HTTPS_RETRIES:-10}"
+  delay="${EASY_OPENVAS_HTTPS_RETRY_DELAY:-2}"
   for ((attempt = 1; attempt <= attempts; attempt++)); do
-    if retrieve_presented_certificate "$output" "$fqdn" && openssl_quiet x509 -in "$output" -noout; then
+    if retrieve_presented_certificate "$output" "$fqdn" && openssl_ok x509 -in "$output" -noout; then
       ok "HTTPS endpoint reachable"
       return 0
     fi
-    if (( attempt < attempts )); then
-      sleep "$delay"
-    fi
+    (( attempt < attempts )) && sleep "$delay"
   done
   error "HTTPS endpoint did not become ready."
   return 1
 }
 
 post_install_checks() {
-  local fqdn="$1"
-  local expected_cert="$2"
-  local presented expected_fp presented_fp
-  printf '
-Post-installation checks
-
-'
-  if is_nginx_running; then
-    ok "nginx container running"
-  else
-    return 1
-  fi
+  local fqdn="$1" expected_cert="$2" presented expected_fp presented_fp
+  printf '\nPost-installation checks\n\n'
+  nginx_running && ok "nginx container running" || return 1
   presented="$(mktemp)"
   TMP_FILES+=("$presented")
-  if ! wait_for_https_certificate "$fqdn" "$presented"; then
-    return 1
-  fi
-  if openssl_quiet x509 -in "$presented" -noout; then
-    ok "TLS handshake successful"
-  else
-    return 1
-  fi
+  wait_for_https "$fqdn" "$presented" || return 1
+  openssl_ok x509 -in "$presented" -noout && ok "TLS handshake successful" || return 1
   expected_fp="$(cert_fingerprint "$expected_cert")"
   presented_fp="$(cert_fingerprint "$presented")"
   if [[ "$expected_fp" == "$presented_fp" ]]; then
     ok "Expected certificate is presented"
-  else
-    return 1
+    return 0
   fi
-  if openssl_quiet x509 -in "$presented" -checkend 0 -noout; then
-    ok "Certificate is valid"
-  else
-    return 1
-  fi
-  if validate_compose_quiet; then
-    ok "Docker Compose configuration valid"
-  else
-    return 1
-  fi
+  error "The certificate presented by nginx does not match the installed certificate."
+  return 1
 }
 
-
-current_mode() {
-  if [[ -f "$CERT_DEST" ]] && awk '/\/etc\/nginx\/certs\/server\.cert\.pem:ro/ { found=1 } END { exit found ? 0 : 1 }' "$COMPOSE_FILE" 2>/dev/null; then
+compose_mode() {
+  local green custom
+  read -r green custom < <(compose_mount_counts)
+  if (( custom == 1 )); then
     printf 'Custom certificate'
   else
     printf 'Greenbone self-signed'
@@ -666,17 +424,15 @@ show_current_certificate() {
   fqdn="$(prompt_value "OpenVAS FQDN:")"
   cert="$(mktemp)"
   TMP_FILES+=("$cert")
-  if ! retrieve_presented_certificate "$cert" "$fqdn" || ! openssl_quiet x509 -in "$cert" -noout; then
-    error "Unable to retrieve the certificate presented by nginx."
-    return 1
-  fi
-  remaining="$(days_remaining "$(cert_end "$cert")")"
+  retrieve_presented_certificate "$cert" "$fqdn" && openssl_ok x509 -in "$cert" -noout \
+    || { error "Unable to retrieve the certificate presented by nginx."; return 1; }
   printf '\nCurrent HTTPS certificate\n\n'
-  printf 'Mode................ %s\n' "$(current_mode)"
+  printf 'Mode................ %s\n' "$(compose_mode)"
   printf 'Subject............. %s\n' "$(cert_subject "$cert")"
   printf 'Issuer.............. %s\n' "$(cert_issuer "$cert")"
   printf 'Valid from.......... %s\n' "$(cert_start "$cert")"
   printf 'Valid until......... %s\n' "$(cert_end "$cert")"
+  remaining="$(days_remaining "$cert")"
   printf 'Days remaining...... %s\n' "$remaining"
   printf 'SAN................. %s\n' "$(cert_san "$cert")"
   if (( remaining < 0 )); then
@@ -686,6 +442,22 @@ show_current_certificate() {
   else
     printf 'Status.............. [OK] Certificate valid\n'
   fi
+  return 0
+}
+
+validate_compose_or_rollback() {
+  if docker_compose_config; then
+    ok "Docker Compose configuration valid"
+    return 0
+  fi
+  error "Docker Compose configuration invalid."
+  restore_backup
+  return 1
+}
+
+rollback_and_recreate() {
+  restore_backup
+  recreate_nginx || true
 }
 
 install_custom_certificate() {
@@ -693,68 +465,52 @@ install_custom_certificate() {
   cert="$(prompt_path "Certificate / fullchain path:")"
   key="$(prompt_path "Private key path:")"
   fqdn="$(prompt_value "OpenVAS FQDN:")"
-
-  validate_certificate_files "$cert" "$key" "$fqdn"
+  validate_certificate_files "$cert" "$key" "$fqdn" || return 1
   printf '\n'
   confirm "Apply this certificate to Easy-OpenVAS? [y/N]:" || return 0
   require_root
-  validate_easy_openvas_installation
+  validate_compose_structure || return 1
   create_backup
-  secure_copy_certificate "$cert" "$key"
-  apply_compose_file "custom"
+  copy_certificate "$cert" "$key"
+  switch_compose_mount custom
   validate_compose_or_rollback || return 1
-  if ! reload_tls_services || ! post_install_checks "$fqdn" "$CERT_DEST"; then
-    error "TLS validation failed after configuration change."
-    restore_backup
-    reload_tls_services || true
+  if ! recreate_nginx || ! post_install_checks "$fqdn" "$CERT_DEST"; then
+    rollback_and_recreate
     printf '\nCustom certificate installation aborted.\n'
     return 1
   fi
-  printf '\nCertificate installation successful.\n\n'
-  printf 'FQDN................. %s\n' "$fqdn"
-  printf 'Certificate.......... %s\n' "$CERT_DEST"
-  printf 'Valid until.......... %s\n' "$(cert_end "$CERT_DEST")"
+  printf '\nCertificate installation successful.\n'
 }
 
 restore_self_signed_certificate() {
-  printf 'This will restore the Greenbone self-signed certificate.\n'
-  printf 'Browser certificate warnings may appear again.\n\n'
+  local fqdn before after
+  printf 'This will restore the Greenbone self-signed certificate.\n\n'
   confirm "Continue? [y/N]:" || return 0
+  fqdn="${EASY_OPENVAS_FQDN:-localhost}"
   require_root
-  info "Restoring Greenbone self-signed TLS..."
-  validate_easy_openvas_installation
+  validate_compose_structure || return 1
+  before="$(mktemp)"
+  after="$(mktemp)"
+  TMP_FILES+=("$before" "$after")
+  retrieve_presented_certificate "$before" "$fqdn" >/dev/null 2>&1 || true
   create_backup
-  apply_compose_file "self-signed"
+  switch_compose_mount self-signed
   validate_compose_or_rollback || return 1
-  if ! reload_tls_services; then
-    error "TLS validation failed after configuration change."
-    restore_backup
-    reload_tls_services || true
+  if ! recreate_nginx; then
+    rollback_and_recreate
     return 1
   fi
-  rm -f -- "$CERT_DEST" "$KEY_DEST"
-  ok "TLS configuration restored"
-  ok "Docker Compose configuration valid"
-  ok "nginx running"
-  if https_endpoint_reachable "${EASY_OPENVAS_FQDN:-localhost}"; then
-    ok "HTTPS endpoint reachable"
-    ok "Greenbone certificate presented"
-  else
-    error "Unable to retrieve the certificate presented by nginx."
-    restore_backup
+  printf '\nPost-restoration checks\n\n'
+  nginx_running && ok "nginx container running" || { rollback_and_recreate; return 1; }
+  wait_for_https "$fqdn" "$after" || { rollback_and_recreate; return 1; }
+  openssl_ok x509 -in "$after" -noout && ok "TLS handshake successful" || { rollback_and_recreate; return 1; }
+  if [[ -s "$before" ]] && [[ "$(cert_fingerprint "$before")" == "$(cert_fingerprint "$after")" ]]; then
+    error "The certificate presented by nginx did not change."
+    rollback_and_recreate
     return 1
   fi
+  ok "Greenbone self-signed certificate restored"
   printf '\nGreenbone self-signed certificate restored successfully.\n'
-}
-
-check_certificate_files_menu() {
-  local cert key fqdn
-  cert="$(prompt_path "Certificate / fullchain path:")"
-  key="$(prompt_path "Private key path:")"
-  fqdn="$(prompt_value "OpenVAS FQDN:")"
-  printf '\nCertificate validation\n\n'
-  validate_certificate_files "$cert" "$key" "$fqdn"
-  printf '\nNo configuration changes were made.\n'
 }
 
 menu() {
@@ -767,8 +523,7 @@ menu() {
 1. Install / replace custom certificate
 2. Show current certificate
 3. Restore Greenbone self-signed certificate
-4. Check certificate files
-5. Exit
+4. Exit
 
 Choice:
 MENU
@@ -778,8 +533,7 @@ MENU
       1) install_custom_certificate ;;
       2) show_current_certificate ;;
       3) restore_self_signed_certificate ;;
-      4) check_certificate_files_menu ;;
-      5) exit 0 ;;
+      4) exit 0 ;;
       *) warning "Invalid choice." ;;
     esac
     printf '\n'
@@ -791,10 +545,10 @@ run_test_command() {
   shift || true
   case "$command" in
     validate-certificate) validate_certificate_files "$(resolve_path "$1")" "$(resolve_path "$2")" "$3" ;;
-    validate-installation) validate_easy_openvas_installation ;;
-    copy-certificate) secure_copy_certificate "$(resolve_path "$1")" "$(resolve_path "$2")" ;;
-    apply-custom) apply_compose_file "custom" ;;
-    apply-self-signed) apply_compose_file "self-signed" ;;
+    validate-installation) validate_compose_structure ;;
+    copy-certificate) copy_certificate "$(resolve_path "$1")" "$(resolve_path "$2")" ;;
+    apply-custom) validate_compose_structure && switch_compose_mount custom ;;
+    apply-self-signed) validate_compose_structure && switch_compose_mount self-signed ;;
     install-custom) install_custom_certificate ;;
     restore-self-signed) restore_self_signed_certificate ;;
     show-current) show_current_certificate ;;
