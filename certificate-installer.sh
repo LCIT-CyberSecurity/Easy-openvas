@@ -1,4 +1,20 @@
 #!/usr/bin/env bash
+
+# Easy-OpenVAS Certificate Manager
+#
+# Manages the HTTPS certificate presented by the Greenbone nginx service.
+#
+# Supports:
+#   - installing or replacing a custom X.509 certificate;
+#   - displaying the certificate currently served over HTTPS;
+#   - restoring the Greenbone-managed self-signed certificate.
+#
+# Custom certificates are stored under /opt/openvas/certs by default and
+# mounted read-only into the nginx container.
+#
+# Changes are validated before and after nginx recreation, with rollback if
+# the expected certificate is not presented successfully.
+
 set -Eeuo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
@@ -16,6 +32,7 @@ TLS_PORT="${EASY_OPENVAS_TLS_PORT:-443}"
 SKIP_ROOT_CHECK="${EASY_OPENVAS_SKIP_ROOT:-false}"
 
 TMP_FILES=()
+# Remove temporary files created during validation and runtime checks.
 cleanup_tmp() {
   local path
   for path in "${TMP_FILES[@]:-}"; do
@@ -30,12 +47,15 @@ ok() { printf '[OK] %s\n' "$*"; }
 warning() { printf '[WARNING] %s\n' "$*"; }
 error() { printf '[ERROR] %s\n' "$*" >&2; }
 
+# Report validation failures before any persistent configuration is changed.
 no_change() {
   error "$1"
   printf 'No configuration has been changed.\n' >&2
   return 1
 }
 
+# Require root only when managing the default system installation path.
+# Test runs and custom base directories can avoid privileged host writes.
 require_root() {
   if [[ "$SKIP_ROOT_CHECK" == "true" || "$OPENVAS_DIR" != "/opt/openvas" ]]; then
     return 0
@@ -47,11 +67,13 @@ require_root() {
   fi
 }
 
+# Resolve operator-provided paths so later checks and copies use explicit files.
 resolve_path() {
   local input="$1"
   realpath -- "$input" 2>/dev/null || realpath -m -- "$input"
 }
 
+# Prompt for a filesystem path and normalize it immediately.
 prompt_path() {
   local label="$1" value
   printf '%s\n> ' "$label" >&2
@@ -59,6 +81,7 @@ prompt_path() {
   resolve_path "$value"
 }
 
+# Prompt for a free-form value without adding shell interpretation.
 prompt_value() {
   local label="$1" value
   printf '%s\n> ' "$label" >&2
@@ -66,6 +89,7 @@ prompt_value() {
   printf '%s' "$value"
 }
 
+# Require explicit operator confirmation before applying certificate changes.
 confirm() {
   local answer
   printf '%s ' "$1"
@@ -73,6 +97,7 @@ confirm() {
   [[ "$answer" == "y" || "$answer" == "Y" || "$answer" == "yes" || "$answer" == "YES" ]]
 }
 
+# Run OpenSSL checks quietly so callers can control user-facing diagnostics.
 openssl_ok() {
   "$OPENSSL_CMD" "$@" >/dev/null 2>&1
 }
@@ -82,6 +107,7 @@ cert_issuer() { "$OPENSSL_CMD" x509 -in "$1" -noout -issuer 2>/dev/null | sed 's
 cert_start() { "$OPENSSL_CMD" x509 -in "$1" -noout -startdate 2>/dev/null | sed 's/^notBefore=//'; }
 cert_end() { "$OPENSSL_CMD" x509 -in "$1" -noout -enddate 2>/dev/null | sed 's/^notAfter=//'; }
 
+# Extract the Subject Alternative Name extension in a compact display format.
 cert_san() {
   "$OPENSSL_CMD" x509 -in "$1" -noout -ext subjectAltName 2>/dev/null \
     | awk 'NR > 1 { gsub(/^ +| +$/, ""); print }' \
@@ -90,6 +116,7 @@ cert_san() {
     || true
 }
 
+# Return only DNS SAN entries because browser hostname validation relies on them.
 cert_dns_names() {
   local entry san
   san="$(cert_san "$1")"
@@ -101,6 +128,8 @@ cert_dns_names() {
   done
 }
 
+# Match the OpenVAS FQDN against a DNS SAN entry.
+# Wildcard matching intentionally follows the single-label TLS rule.
 hostname_matches_dns_san() {
   local fqdn="${1,,}" san="${2,,}" suffix prefix
   [[ "$fqdn" == "$san" ]] && return 0
@@ -111,6 +140,7 @@ hostname_matches_dns_san() {
   [[ -n "$prefix" && "$prefix" != *.* ]]
 }
 
+# Verify that the certificate DNS SAN covers the configured OpenVAS FQDN.
 cert_covers_fqdn() {
   local cert="$1" fqdn="$2" san
   while IFS= read -r san; do
@@ -121,6 +151,7 @@ cert_covers_fqdn() {
 
 date_epoch() { date -d "$1" +%s; }
 
+# Calculate certificate lifetime remaining for warnings and admin display.
 days_remaining() {
   local end_epoch now_epoch
   end_epoch="$(date_epoch "$(cert_end "$1")")"
@@ -128,10 +159,12 @@ days_remaining() {
   printf '%s\n' $(((end_epoch - now_epoch) / 86400))
 }
 
+# Produce a SHA-256 certificate fingerprint for runtime identity checks.
 cert_fingerprint() {
   "$OPENSSL_CMD" x509 -in "$1" -noout -fingerprint -sha256 2>/dev/null | sed 's/^.*=//'
 }
 
+# Compare extracted public keys to confirm the certificate and private key match.
 cert_key_match() {
   local cert="$1" key="$2" cert_pub key_pub
   cert_pub="$(mktemp)"
@@ -142,11 +175,14 @@ cert_key_match() {
   cmp -s "$cert_pub" "$key_pub"
 }
 
+# Identify self-signed certificates to avoid unnecessary chain warnings.
 cert_is_self_signed() {
   local cert="$1"
   [[ "$(cert_subject "$cert")" == "$(cert_issuer "$cert")" ]] && openssl_ok verify -CAfile "$cert" "$cert"
 }
 
+# Warn when an issued certificate appears to be missing intermediate CAs.
+# This is advisory because chain requirements depend on the issuing CA.
 warn_if_single_non_self_signed_cert() {
   local count
   count="$(grep -c -- '-----BEGIN CERTIFICATE-----' "$1" || true)"
@@ -156,6 +192,7 @@ warn_if_single_non_self_signed_cert() {
   fi
 }
 
+# Show certificate metadata that helps admins verify the selected TLS material.
 print_certificate_block() {
   local title="$1" cert="$2" remaining san
   remaining="$(days_remaining "$cert")"
@@ -169,6 +206,9 @@ print_certificate_block() {
   printf 'SAN................. %s\n' "${san:-Not present}"
 }
 
+# Validate the supplied X.509 certificate and private key before making any
+# system changes. Checks format, key matching, validity dates, DNS SAN coverage,
+# and basic certificate-chain completeness.
 validate_certificate_files() {
   local cert="$1" key="$2" fqdn="$3" remaining
   if [[ -f "$cert" && -r "$cert" ]]; then
@@ -226,10 +266,12 @@ validate_certificate_files() {
   return 0
 }
 
+# Confirm that the expected Greenbone nginx service exists in compose.yaml.
 service_exists() {
   awk -v svc="$1" '$0 ~ "^  " svc ":$" { found=1 } END { exit found ? 0 : 1 }' "$COMPOSE_FILE"
 }
 
+# Count nginx certificate mounts to ensure there is exactly one TLS source.
 compose_mount_counts() {
   awk '
     /^  nginx:$/ { svc="nginx"; next }
@@ -240,6 +282,7 @@ compose_mount_counts() {
   ' "$COMPOSE_FILE"
 }
 
+# Detect either the Greenbone-managed volume or the Easy-OpenVAS custom mount.
 compose_has_managed_mount() {
   awk '
     /^  nginx:$/ { svc="nginx"; next }
@@ -250,6 +293,8 @@ compose_has_managed_mount() {
   ' "$COMPOSE_FILE"
 }
 
+# Validate the Compose shape before editing it so unsupported Greenbone layouts
+# fail without changing certificate files or service configuration.
 validate_compose_structure() {
   local green custom
   if [[ ! -f "$COMPOSE_FILE" ]]; then
@@ -265,10 +310,12 @@ validate_compose_structure() {
   fi
 }
 
+# Ask Docker Compose to render the final configuration after local edits.
 docker_compose_config() {
   (cd "$OPENVAS_DIR" && "$DOCKER_CMD" compose -f "$COMPOSE_FILE" config >/dev/null)
 }
 
+# Keep one rollback copy only; certificate backups may contain private keys.
 create_backup() {
   info "Creating rollback backup..."
   rm -rf -- "$BACKUP_DIR"
@@ -283,6 +330,7 @@ create_backup() {
   ok "Backup created"
 }
 
+# Restore the previous Compose and certificate state after a failed change.
 restore_backup() {
   info "Restoring previous configuration..."
   cp -- "$BACKUP_DIR/compose.yaml" "$COMPOSE_FILE"
@@ -302,6 +350,8 @@ restore_backup() {
   ok "Rollback completed."
 }
 
+# Copy validated certificate material into the persistent Easy-OpenVAS
+# certificate directory using Greenbone's expected filenames.
 copy_certificate() {
   local cert="$1" key="$2" tmp_cert tmp_key
   mkdir -p -- "$CERTS_DIR"
@@ -320,6 +370,11 @@ copy_certificate() {
   return 0
 }
 
+# Switch nginx between the Greenbone-managed certificate volume and the
+# Easy-OpenVAS custom certificate directory.
+#
+# The Greenbone configuration is kept visible in compose.yaml so an
+# administrator can understand and manually revert the TLS source.
 switch_compose_mount() {
   local mode="$1" tmp original_mode
   original_mode="$(stat -c '%a' "$COMPOSE_FILE")"
@@ -356,10 +411,13 @@ switch_compose_mount() {
   return 0
 }
 
+# Force nginx recreation because replacing certificate files does not change
+# the Compose definition and nginx may otherwise keep serving the old cert.
 recreate_nginx() {
   (cd "$OPENVAS_DIR" && "$DOCKER_CMD" compose -f "$COMPOSE_FILE" up -d --force-recreate nginx >/dev/null)
 }
 
+# Confirm the nginx container is running before checking the HTTPS endpoint.
 nginx_running() {
   local id status
   id="$(cd "$OPENVAS_DIR" && "$DOCKER_CMD" compose -f "$COMPOSE_FILE" ps -q nginx 2>/dev/null | head -n 1)"
@@ -368,6 +426,8 @@ nginx_running() {
   [[ "$status" == "running" ]]
 }
 
+# Retrieve the certificate actually presented by the HTTPS endpoint.
+# This validates runtime behavior rather than only checking files on disk.
 retrieve_presented_certificate() {
   local output="$1" fqdn="$2"
   if [[ -n "$HTTPS_CERT_CMD" ]]; then
@@ -378,6 +438,7 @@ retrieve_presented_certificate() {
     | "$OPENSSL_CMD" x509 -outform PEM >"$output"
 }
 
+# Retry HTTPS certificate retrieval while nginx restarts and reloads TLS state.
 wait_for_https() {
   local fqdn="$1" output="$2" attempt attempts delay
   attempts="${EASY_OPENVAS_HTTPS_RETRIES:-10}"
@@ -393,6 +454,8 @@ wait_for_https() {
   return 1
 }
 
+# Verify the runtime TLS endpoint after installation.
+# SHA-256 fingerprints ensure nginx serves the certificate that was installed.
 post_install_checks() {
   local fqdn="$1" expected_cert="$2" presented expected_fp presented_fp
   printf '\nPost-installation checks\n\n'
@@ -411,6 +474,7 @@ post_install_checks() {
   return 1
 }
 
+# Report the currently selected nginx certificate source from compose.yaml.
 compose_mode() {
   local green custom
   read -r green custom < <(compose_mount_counts)
@@ -421,6 +485,7 @@ compose_mode() {
   fi
 }
 
+# Display the certificate currently served by nginx, not just local files.
 show_current_certificate() {
   local fqdn cert remaining
   fqdn="$(prompt_value "OpenVAS FQDN:")"
@@ -447,6 +512,7 @@ show_current_certificate() {
   return 0
 }
 
+# Roll back immediately if the edited Compose file cannot be rendered.
 validate_compose_or_rollback() {
   if docker_compose_config; then
     ok "Docker Compose configuration valid"
@@ -457,11 +523,14 @@ validate_compose_or_rollback() {
   return 1
 }
 
+# Restore the previous state, then recreate nginx with the known-good config.
 rollback_and_recreate() {
   restore_backup
   recreate_nginx || true
 }
 
+# Install a custom certificate only after validation and explicit confirmation.
+# Any failed Compose or runtime TLS check triggers rollback.
 install_custom_certificate() {
   local cert key fqdn
   cert="$(prompt_path "Certificate / fullchain path:")"
@@ -484,6 +553,9 @@ install_custom_certificate() {
   printf '\nCertificate installation successful.\n'
 }
 
+# Restore the Greenbone-managed self-signed certificate source.
+# If self-signed mode is already active, the operation is intentionally treated
+# as a successful no-op.
 restore_self_signed_certificate() {
   local fqdn before after before_fp after_fp
   printf 'This will restore the Greenbone self-signed certificate.\n\n'
@@ -521,6 +593,7 @@ restore_self_signed_certificate() {
   printf '\nGreenbone self-signed certificate restored successfully.\n'
 }
 
+# Present certificate operations without applying changes until an option is run.
 menu() {
   while true; do
     cat <<'MENU'
@@ -548,6 +621,7 @@ MENU
   done
 }
 
+# Expose focused entry points used by tests without launching the menu.
 run_test_command() {
   local command="${1:-}"
   shift || true
@@ -564,6 +638,7 @@ run_test_command() {
   esac
 }
 
+# Route either test commands or the normal interactive certificate menu.
 main() {
   if [[ "${1:-}" == "--test-command" ]]; then
     shift

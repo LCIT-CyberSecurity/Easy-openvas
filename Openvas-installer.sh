@@ -1,5 +1,20 @@
 #!/bin/bash
 
+# Easy-OpenVAS Installer
+#
+# Deploys the Greenbone Community Edition container stack.
+#
+# Supported deployment modes:
+#   - Fresh Debian 13 server:
+#     Docker CE and Docker Compose v2 are installed before deploying OpenVAS.
+#
+#   - Existing Docker server:
+#     The existing Docker environment is validated and reused without being
+#     upgraded, reconfigured, restarted, or otherwise modified.
+#
+# The installer configures the OpenVAS service FQDN and performs basic DNS,
+# port availability, and Docker Compose validation checks before deployment.
+
 set -e
 
 DOCKER_CMD="${EASY_OPENVAS_DOCKER_CMD:-docker}"
@@ -14,6 +29,9 @@ info() { echo "[INFO] $*"; }
 warning() { echo "[WARNING] $*"; }
 error() { echo "[ERROR] $*" >&2; }
 
+# Require root only for the default system installation path.
+# Tests and custom base directories can bypass this guard without changing
+# privileged host locations.
 require_root() {
   if [ "$SKIP_ROOT_CHECK" = "true" ] || [ "$OPENVAS_DIR" != "/opt/openvas" ]; then
     return 0
@@ -26,6 +44,7 @@ require_root() {
   fi
 }
 
+# Normalize user-provided hostnames before validation and Compose injection.
 normalize_fqdn() {
   local FQDN="$1"
   FQDN="$(printf '%s' "$FQDN" | tr '[:upper:]' '[:lower:]')"
@@ -33,10 +52,12 @@ normalize_fqdn() {
   printf '%s' "$FQDN"
 }
 
+# Detect IPv4-looking values so they are not accepted as OpenVAS service FQDNs.
 is_ipv4_address() {
   [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
 }
 
+# Validate the DNS name format expected for browser-facing OpenVAS access.
 is_valid_fqdn() {
   local FQDN="$1"
   [ -n "$FQDN" ] || return 1
@@ -46,6 +67,8 @@ is_valid_fqdn() {
   [[ "$FQDN" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]
 }
 
+# Derive a convenient OpenVAS service FQDN from the host domain.
+# The generated value is only a default suggestion and can be overridden.
 suggest_openvas_fqdn() {
   local HOST_FQDN DOMAIN CANDIDATE
   HOST_FQDN="$(normalize_fqdn "$1")"
@@ -58,6 +81,8 @@ suggest_openvas_fqdn() {
   fi
 }
 
+# Prompt until a valid OpenVAS FQDN is provided.
+# The suggested value is accepted only when it passes the same validation.
 prompt_openvas_fqdn() {
   local HOST_FQDN="$1" DEFAULT_FQDN INPUT NORMALIZED
   DEFAULT_FQDN="$(suggest_openvas_fqdn "$HOST_FQDN")"
@@ -90,6 +115,8 @@ prompt_openvas_fqdn() {
   done
 }
 
+# DNS resolution is informational only because the DNS record may be
+# provisioned before or after Easy-OpenVAS installation.
 check_openvas_dns() {
   local FQDN="$1" GETENT_CMD OUTPUT IPS
   GETENT_CMD="${EASY_OPENVAS_GETENT_CMD:-getent}"
@@ -107,6 +134,8 @@ check_openvas_dns() {
   fi
 }
 
+# Configure Greenbone's native nginx host and origin settings for the
+# OpenVAS service FQDN instead of changing internal Docker hostnames.
 configure_gvm_config_fqdn() {
   local TMP ORIGINAL_MODE
   ORIGINAL_MODE="$(stat -c '%a' "$COMPOSE_FILE")"
@@ -157,6 +186,8 @@ configure_gvm_config_fqdn() {
   chmod "$ORIGINAL_MODE" "$COMPOSE_FILE"
 }
 
+# Validate the generated Compose configuration before pulling or starting
+# containers to avoid partially deploying an invalid stack.
 validate_docker_compose_config() {
   if "$DOCKER_CMD" compose -f "$COMPOSE_FILE" config >/dev/null; then
     ok "Docker Compose configuration valid"
@@ -167,6 +198,7 @@ validate_docker_compose_config() {
   return 1
 }
 
+# Check Docker CLI availability, with test overrides kept local to this script.
 docker_command_exists() {
   case "${EASY_OPENVAS_DOCKER_PRESENT:-}" in
     true) return 0 ;;
@@ -175,14 +207,19 @@ docker_command_exists() {
   command -v "$DOCKER_CMD" >/dev/null 2>&1
 }
 
+# Confirm the Docker daemon can answer API requests.
 docker_daemon_operational() {
   "$DOCKER_CMD" info >/dev/null 2>&1
 }
 
+# Require Docker Compose v2 through the Docker CLI plugin interface.
 docker_compose_available() {
   "$DOCKER_CMD" compose version >/dev/null 2>&1
 }
 
+# Fresh-server installation is intentionally limited to Debian 13.
+# Existing Docker deployments are validated through Docker capabilities
+# rather than the underlying Linux distribution.
 is_debian_13() {
   local ID_VALUE="" VERSION_ID_VALUE=""
   [ -r "$OS_RELEASE_FILE" ] || return 1
@@ -192,6 +229,7 @@ is_debian_13() {
   [ "$ID_VALUE" = "debian" ] && [ "$VERSION_ID_VALUE" = "13" ]
 }
 
+# Enforce the Debian 13 guard before any fresh-server system changes.
 check_fresh_debian13() {
   if is_debian_13; then
     ok "Debian 13 detected"
@@ -203,6 +241,8 @@ check_fresh_debian13() {
   return 1
 }
 
+# Keep fresh-server mode from taking over a host that already has Docker.
+# Existing Docker installations may belong to the customer environment.
 ensure_no_existing_docker_for_fresh() {
   if ! docker_command_exists; then
     ok "No existing Docker installation detected"
@@ -220,6 +260,9 @@ ensure_no_existing_docker_for_fresh() {
   return 1
 }
 
+# Validate an existing Docker installation without modifying it.
+# Customer Docker hosts may run unrelated workloads, so this code path must
+# never install, upgrade, restart, or reconfigure Docker.
 check_existing_docker_environment() {
   echo "Docker environment"
   echo ""
@@ -257,11 +300,14 @@ check_existing_docker_environment() {
   return 0
 }
 
+# Check whether a host TCP port is already bound by another process.
 port_is_available() {
   local PORT="$1"
   ! "$SS_CMD" -ltn 2>/dev/null | awk -v port=":$PORT" 'NR > 1 { split($4, addr, ":"); if ($4 ~ port "$") found=1 } END { exit found ? 0 : 1 }'
 }
 
+# Check required host ports before starting Greenbone.
+# Existing processes or containers are never stopped automatically.
 check_required_ports() {
   local PORT FAILED=0
   for PORT in 443 9392; do
@@ -280,6 +326,7 @@ check_required_ports() {
   fi
 }
 
+# Refuse to overwrite an existing Easy-OpenVAS Compose deployment.
 check_no_existing_openvas_installation() {
   if [ -e "$COMPOSE_FILE" ]; then
     error "An existing Easy-OpenVAS installation was detected in $OPENVAS_DIR."
@@ -288,6 +335,9 @@ check_no_existing_openvas_installation() {
   fi
 }
 
+# Install Docker CE and Docker Compose v2 for the fresh Debian 13 mode.
+# This function must only be reached when no operational Docker installation
+# is already present.
 install_docker() {
   info "Installing Docker for Easy-OpenVAS..."
 
@@ -351,6 +401,7 @@ install_docker() {
   echo ""
 }
 
+# Detect the host identity used to suggest the browser-facing OpenVAS FQDN.
 detect_server_identity() {
   echo "[1/9] Detecting server FQDN and IP address..."
 
@@ -373,6 +424,7 @@ detect_server_identity() {
   echo ""
 }
 
+# Select and validate the OpenVAS service FQDN before writing Compose changes.
 select_openvas_fqdn() {
   echo "Selecting OpenVAS service FQDN..."
   OPENVAS_FQDN="$(prompt_openvas_fqdn "$SERVER_FQDN")"
@@ -380,6 +432,7 @@ select_openvas_fqdn() {
   echo ""
 }
 
+# Prepare the installation directory that will hold the downloaded Compose file.
 prepare_openvas_directory() {
   echo "[7/9] Preparing OpenVAS installation directory..."
 
@@ -390,6 +443,8 @@ prepare_openvas_directory() {
   echo ""
 }
 
+# Fetch the Greenbone Community Edition Compose definition.
+# Test mode can provide a local source to avoid network access.
 download_compose_file() {
   echo "[8/9] Downloading OpenVAS Docker Compose file..."
 
@@ -404,6 +459,8 @@ download_compose_file() {
   echo ""
 }
 
+# Adjust the downloaded Compose file for external HTTPS access and the selected
+# OpenVAS FQDN, then validate the resulting configuration.
 configure_openvas_compose() {
   echo "Configuring OpenVAS web access on all network interfaces..."
   sed -i \
@@ -423,6 +480,8 @@ configure_openvas_compose() {
   echo ""
 }
 
+# Wait for a Compose service to reach Docker's healthy state.
+# On timeout, show logs and container status before aborting the deployment.
 wait_for_healthy_service() {
   local SERVICE_NAME="$1"
   local CONTAINER_ID
@@ -467,6 +526,8 @@ wait_for_healthy_service() {
   done
 }
 
+# Start Greenbone feed data containers first so shared volumes are populated
+# before the rest of the OpenVAS stack depends on them.
 start_openvas_containers() {
   local SERVICE_NAME
   echo "[9/9] Starting OpenVAS containers..."
@@ -517,6 +578,7 @@ start_openvas_containers() {
   echo ""
 }
 
+# Print post-installation access details and operational commands for admins.
 print_completion() {
   echo "=================================================="
   echo " Installation completed"
@@ -577,6 +639,8 @@ print_completion() {
   echo ""
 }
 
+# Run the common OpenVAS deployment sequence after the selected mode has
+# completed its own safety checks.
 deploy_openvas_stack() {
   detect_server_identity
   select_openvas_fqdn
@@ -589,6 +653,8 @@ deploy_openvas_stack() {
   print_completion
 }
 
+# Fresh Debian 13 mode may install Docker, but only after OS and Docker guards
+# have confirmed that this is a clean target.
 install_fresh_debian13_server() {
   check_fresh_debian13 || return 1
   ensure_no_existing_docker_for_fresh || return 1
@@ -596,11 +662,14 @@ install_fresh_debian13_server() {
   deploy_openvas_stack
 }
 
+# Existing Docker mode validates Docker capabilities and then deploys only the
+# Easy-OpenVAS Greenbone stack.
 install_existing_docker_server() {
   check_existing_docker_environment || return 1
   deploy_openvas_stack
 }
 
+# Show the interactive deployment menu.
 print_menu() {
   cat <<'MENU'
 ========================================
@@ -615,6 +684,8 @@ Choice:
 MENU
 }
 
+# Select the deployment mode explicitly so a pre-existing Docker environment is
+# never mistaken for a fresh-server installation.
 main_menu() {
   local CHOICE
   while true; do
@@ -633,6 +704,8 @@ main_menu() {
   done
 }
 
+# Expose focused entry points used by the test suite without running the
+# interactive installer.
 run_test_command() {
   local COMMAND="${1:-}"
   shift || true
@@ -661,6 +734,7 @@ run_test_command() {
   esac
 }
 
+# Route either test commands or the normal interactive installer.
 main() {
   if [ "${1:-}" = "--test-command" ]; then
     shift
