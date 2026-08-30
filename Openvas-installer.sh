@@ -15,17 +15,23 @@ normalize_fqdn() {
   printf '%s' "$FQDN"
 }
 
+is_ipv4_address() {
+  [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
+}
+
 is_valid_fqdn() {
   local FQDN="$1"
   [ -n "$FQDN" ] || return 1
   [ "${#FQDN}" -le 253 ] || return 1
   [[ "$FQDN" == *.* ]] || return 1
+  ! is_ipv4_address "$FQDN" || return 1
   [[ "$FQDN" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]
 }
 
 suggest_openvas_fqdn() {
   local HOST_FQDN DOMAIN CANDIDATE
   HOST_FQDN="$(normalize_fqdn "$1")"
+  ! is_ipv4_address "$HOST_FQDN" || return 0
   [[ "$HOST_FQDN" == *.* ]] || return 0
   DOMAIN="${HOST_FQDN#*.}"
   CANDIDATE="openvas.$DOMAIN"
@@ -84,7 +90,8 @@ check_openvas_dns() {
 }
 
 configure_gvm_config_fqdn() {
-  local TMP
+  local TMP ORIGINAL_MODE
+  ORIGINAL_MODE="$(stat -c '%a' "$COMPOSE_FILE")"
   TMP="$(mktemp)"
   if ! awk -v host="$OPENVAS_FQDN" '
     function emit_fqdn() {
@@ -129,6 +136,7 @@ configure_gvm_config_fqdn() {
     return 1
   fi
   mv -f "$TMP" "$COMPOSE_FILE"
+  chmod "$ORIGINAL_MODE" "$COMPOSE_FILE"
 }
 
 validate_docker_compose_config() {

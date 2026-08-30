@@ -321,7 +321,8 @@ copy_certificate() {
 }
 
 switch_compose_mount() {
-  local mode="$1" tmp
+  local mode="$1" tmp original_mode
+  original_mode="$(stat -c '%a' "$COMPOSE_FILE")"
   tmp="$(mktemp)"
   TMP_FILES+=("$tmp")
   awk -v mode="$mode" -v certs="$CERTS_DIR" '
@@ -351,6 +352,7 @@ switch_compose_mount() {
     END { if (svc=="nginx" && !emitted) emit_block() }
   ' "$COMPOSE_FILE" >"$tmp"
   mv -f -- "$tmp" "$COMPOSE_FILE"
+  chmod "$original_mode" "$COMPOSE_FILE"
   return 0
 }
 
@@ -483,16 +485,21 @@ install_custom_certificate() {
 }
 
 restore_self_signed_certificate() {
-  local fqdn before after
+  local fqdn before after before_fp after_fp
   printf 'This will restore the Greenbone self-signed certificate.\n\n'
-  confirm "Continue? [y/N]:" || return 0
   fqdn="${EASY_OPENVAS_FQDN:-localhost}"
   require_root
   validate_compose_structure || return 1
+  if [[ "$(compose_mode)" == "Greenbone self-signed" ]]; then
+    ok "Greenbone self-signed certificate is already active."
+    return 0
+  fi
+  confirm "Continue? [y/N]:" || return 0
   before="$(mktemp)"
   after="$(mktemp)"
   TMP_FILES+=("$before" "$after")
-  retrieve_presented_certificate "$before" "$fqdn" >/dev/null 2>&1 || true
+  wait_for_https "$fqdn" "$before" || return 1
+  before_fp="$(cert_fingerprint "$before")"
   create_backup
   switch_compose_mount self-signed
   validate_compose_or_rollback || return 1
@@ -504,7 +511,8 @@ restore_self_signed_certificate() {
   nginx_running && ok "nginx container running" || { rollback_and_recreate; return 1; }
   wait_for_https "$fqdn" "$after" || { rollback_and_recreate; return 1; }
   openssl_ok x509 -in "$after" -noout && ok "TLS handshake successful" || { rollback_and_recreate; return 1; }
-  if [[ -s "$before" ]] && [[ "$(cert_fingerprint "$before")" == "$(cert_fingerprint "$after")" ]]; then
+  after_fp="$(cert_fingerprint "$after")"
+  if [[ "$before_fp" == "$after_fp" ]]; then
     error "The certificate presented by nginx did not change."
     rollback_and_recreate
     return 1

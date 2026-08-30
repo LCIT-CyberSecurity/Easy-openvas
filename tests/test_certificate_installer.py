@@ -344,8 +344,11 @@ class CertificateInstallerTests(unittest.TestCase):
         env = make_env(self.tmp_path, base=base)
         original_gvm = "      ENABLE_NGINX_CONFIG: true\n      ENABLE_TLS_GENERATION: true\n"
 
+        compose.chmod(0o640)
         self.assertEqual(run_installer("apply-custom", env=env).returncode, 0)
+        self.assertEqual(stat.S_IMODE(compose.stat().st_mode), 0o640)
         self.assertEqual(run_installer("apply-custom", env=env).returncode, 0)
+        self.assertEqual(stat.S_IMODE(compose.stat().st_mode), 0o640)
         content = compose.read_text()
         self.assertIn(CUSTOM_BLOCK.format(certs=base / "certs"), content)
         self.assertEqual(active_mounts(content), [f"- {base / 'certs'}:/etc/nginx/certs:ro"])
@@ -354,7 +357,9 @@ class CertificateInstallerTests(unittest.TestCase):
         self.assertIn(original_gvm, content)
 
         self.assertEqual(run_installer("apply-self-signed", env=env).returncode, 0)
+        self.assertEqual(stat.S_IMODE(compose.stat().st_mode), 0o640)
         self.assertEqual(run_installer("apply-self-signed", env=env).returncode, 0)
+        self.assertEqual(stat.S_IMODE(compose.stat().st_mode), 0o640)
         content = compose.read_text()
         self.assertIn(SELF_SIGNED_BLOCK.format(certs=base / "certs"), content)
         self.assertEqual(active_mounts(content), ["- nginx_certificates_vol:/etc/nginx/certs:ro"])
@@ -465,6 +470,20 @@ cp "{cert}" "$EASY_OPENVAS_CERT_OUTPUT"
         self.assertEqual(compose.read_text(), before)
         self.assertNotIn("up -d --force-recreate nginx", log.read_text())
 
+
+    def test_restore_self_signed_is_noop_when_already_active(self):
+        base = self.tmp_path / "openvas"
+        compose = write_compose(base)
+        before = compose.read_text()
+        docker = self.tmp_path / "docker"
+        log = write_mock_docker(docker)
+        env = make_env(self.tmp_path, base=base, docker=docker)
+        result = run_installer("restore-self-signed", env=env, input_text="y\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("[OK] Greenbone self-signed certificate is already active.", result.stdout)
+        self.assertEqual(compose.read_text(), before)
+        self.assertFalse(log.exists())
+
     def test_restore_self_signed_switches_mount_and_checks_certificate_changed(self):
         base = self.tmp_path / "openvas"
         compose = write_compose(base)
@@ -479,10 +498,13 @@ cp "{cert}" "$EASY_OPENVAS_CERT_OUTPUT"
         result = run_installer("install-custom", env=env, input_text=f"{custom_cert}\n{custom_key}\nopenvas.client.fr\ny\n")
         self.assertEqual(result.returncode, 0, result.stderr)
 
-        write_https_helper(restore_https, custom_cert, greenbone_cert)
+        restore_attempts = write_https_helper(restore_https, custom_cert, greenbone_cert)
         env = make_env(self.tmp_path, base=base, docker=docker, https_helper=restore_https)
         result = run_installer("restore-self-signed", env=env, input_text="y\n")
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(restore_attempts.read_text(), "2")
+        docker_log = (self.tmp_path / "docker.log").read_text()
+        self.assertIn("up -d --force-recreate nginx", docker_log)
         content = compose.read_text()
         self.assertEqual(active_mounts(content), ["- nginx_certificates_vol:/etc/nginx/certs:ro"])
         self.assertIn(f"# - {base / 'certs'}:/etc/nginx/certs:ro", content)

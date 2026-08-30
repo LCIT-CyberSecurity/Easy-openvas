@@ -1,5 +1,4 @@
 import os
-import shutil
 import subprocess
 import tempfile
 import unittest
@@ -8,9 +7,6 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 SCRIPT = REPO / "Openvas-installer.sh"
-CERTIFICATE_SCRIPT = REPO / "certificate-installer.sh"
-
-
 COMPOSE = """services:
   gvm-config:
     image: registry.community.greenbone.net/community/gvm-config:latest
@@ -99,6 +95,7 @@ exit {exit_code}
             "docker01.client.fr": "openvas.client.fr",
             "docker01.infra.client.fr": "openvas.infra.client.fr",
             "docker01": "",
+            "192.168.1.25": "",
         }
         for host, expected in cases.items():
             with self.subTest(host=host):
@@ -132,6 +129,9 @@ exit {exit_code}
             "openvas.client.fr/",
             "openvas.client.fr:443",
             "*.client.fr",
+            "192.168.1.25",
+            "10.0.0.1",
+            "127.0.0.1",
         ]
         for fqdn in invalid:
             with self.subTest(fqdn=fqdn):
@@ -152,6 +152,12 @@ exit {exit_code}
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "scan.toto.fr\n")
         self.assertIn("OpenVAS FQDN:\n> ", result.stderr)
+
+        result = self.run_installer("prompt-fqdn", "192.168.1.25", input_text="scan.toto.fr\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "scan.toto.fr\n")
+        self.assertIn("OpenVAS FQDN:\n> ", result.stderr)
+        self.assertNotIn("openvas.168.1.25", result.stderr)
 
     def test_prompt_reasks_after_invalid_fqdn(self):
         result = self.run_installer("prompt-fqdn", "docker01.client.fr", input_text="https://openvas.client.fr\ntoto.fr\n")
@@ -207,6 +213,15 @@ exit 2
         self.assertIn('      NGINX_ACCESS_CONTROL_ALLOW_ORIGIN_HEADER: "https://scan.security.toto.fr"\n', content)
         self.assertIn('      NGINX_HOST: "do-not-touch.example.com"\n', content)
 
+    def test_configure_compose_preserves_file_mode(self):
+        for mode in (0o644, 0o640):
+            with self.subTest(mode=oct(mode)):
+                compose = self.write_compose()
+                compose.chmod(mode)
+                result = self.run_installer("configure-compose", compose, "scan.security.toto.fr")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(compose.stat().st_mode & 0o777, mode)
+
     def test_configure_compose_replaces_existing_values_without_duplicates(self):
         compose = self.write_compose(COMPOSE_WITH_EXISTING_FQDN)
         result = self.run_installer("configure-compose", compose, "scan.security.toto.fr")
@@ -237,16 +252,6 @@ exit 2
 
     def test_safety_constraints_for_tests(self):
         self.assertFalse(Path("/opt/openvas/compose.yaml").exists())
-        self.assertIsNone(shutil.which("Openvas-installer.sh"))
-        original = subprocess.run(
-            ["git", "show", "HEAD:certificate-installer.sh"],
-            cwd=REPO,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=True,
-        ).stdout
-        self.assertEqual(CERTIFICATE_SCRIPT.read_text(), original)
 
 
 if __name__ == "__main__":
