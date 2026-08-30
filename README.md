@@ -1,16 +1,30 @@
 # Easy-openvas
 
-Setup a full OpenVAS service easily on a Debian host with Docker.
+Setup a full OpenVAS service easily with Docker.
 
 ## Prerequisites
 
-- A Debian 13 machine.
 - A user account with sudo privileges.
 - Recommended CPU: 2 vCPU minimum, 4 vCPU for a comfortable experience.
 - Recommended RAM: 8 GB minimum, 12 GB or more for a comfortable experience.
 - Recommended disk space: at least 100 GB free.
 - A stable internet connection for Docker image downloads and vulnerability feed synchronization.
 - Network access to the targets you want to scan.
+
+Easy-OpenVAS can be deployed in two ways:
+
+1. Fresh Debian 13 server
+   Easy-OpenVAS installs Docker automatically. This mode currently targets Debian 13 (Trixie).
+2. Existing Docker server
+   Easy-OpenVAS reuses the existing Docker installation.
+
+For an existing Docker server, the prerequisites are:
+
+- Docker daemon operational.
+- Docker Compose v2 available through `docker compose`.
+- TCP ports `443` and `9392` available.
+
+When using an existing Docker server, Easy-OpenVAS does not uninstall, upgrade, reconfigure or restart Docker. It does not stop or modify existing containers.
 
 ## Official documentation
 
@@ -45,7 +59,15 @@ Run the installer with sudo:
 sudo ./Openvas-installer.sh
 ```
 
-The script installs Docker, downloads the OpenVAS Docker Compose file, starts the containers, and prints the access information at the end.
+The installer displays a menu:
+
+```text
+1. Install OpenVAS on a fresh Debian 13 server
+2. Install OpenVAS on an existing Docker server
+3. Exit
+```
+
+Option 1 checks that the system is Debian 13 and that Docker is not already installed before installing Docker. Option 2 checks the existing Docker environment and then deploys only the Easy-OpenVAS Greenbone/OpenVAS stack.
 
 ## Updating Docker images without losing data
 
