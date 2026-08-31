@@ -18,13 +18,19 @@ Easy-OpenVAS can be deployed in two ways:
 2. Existing Docker server
    Easy-OpenVAS reuses the existing Docker installation.
 
+Easy-OpenVAS never automatically removes existing container runtimes or container-management software. If conflicting packages prevent Docker CE installation in Fresh Debian mode, the installer stops and asks the administrator to resolve the conflict manually.
+
 For an existing Docker server, the prerequisites are:
 
 - Docker daemon operational.
 - Docker Compose v2 available through `docker compose`.
+- Active Docker endpoint must be local, not a remote `tcp://` or `ssh://` context.
+- No existing Easy-OpenVAS installation in `/opt/openvas`.
+- No existing Greenbone/OpenVAS Docker Compose project detected.
 - TCP ports `443` and `9392` available.
+- Basic CPU, RAM, and disk capacity checks pass.
 
-When using an existing Docker server, Easy-OpenVAS does not uninstall, upgrade, reconfigure or restart Docker. It does not stop or modify existing containers.
+When using an existing Docker server, Easy-OpenVAS reuses Docker as-is. It does not install, uninstall, upgrade, reconfigure, restart or otherwise manage the Docker daemon, and it does not stop or modify existing containers, volumes, networks or workloads. The installer checks for port conflicts, Greenbone project collisions, local Docker context, and available resources before asking for explicit deployment confirmation.
 
 ## Official documentation
 

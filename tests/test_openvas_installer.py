@@ -81,7 +81,18 @@ class OpenvasInstallerTests(unittest.TestCase):
         getent.chmod(0o755)
         return getent
 
-    def write_docker(self, *, info_exit=0, compose_version_exit=0, config_exit=0):
+    def write_docker(
+        self,
+        *,
+        info_exit=0,
+        compose_version_exit=0,
+        config_exit=0,
+        context_show="",
+        context_endpoint="",
+        compose_projects="",
+        label_projects="",
+        docker_root="",
+    ):
         docker = self.tmp_path / "docker"
         docker.write_text(f"""#!/usr/bin/env bash
 set -u
@@ -90,12 +101,28 @@ if [[ "${{1:-}}" == "--version" ]]; then
   printf 'Docker version 27.0.0, build mock\n'
   exit 0
 fi
+if [[ "${{1:-}}" == "info" && "${{2:-}}" == "--format" ]]; then
+  printf '{docker_root}\n'
+  exit {info_exit}
+fi
 if [[ "${{1:-}}" == "info" ]]; then
   exit {info_exit}
+fi
+if [[ "${{1:-}}" == "context" && "${{2:-}}" == "show" ]]; then
+  printf '{context_show}\n'
+  exit 0
+fi
+if [[ "${{1:-}}" == "context" && "${{2:-}}" == "inspect" ]]; then
+  printf '{context_endpoint}\n'
+  exit 0
 fi
 if [[ "${{1:-}}" == "compose" && "${{2:-}}" == "version" ]]; then
   printf 'Docker Compose version v2.29.0\n'
   exit {compose_version_exit}
+fi
+if [[ "${{1:-}}" == "compose" && "${{2:-}}" == "ls" ]]; then
+  printf '{compose_projects}\n'
+  exit 0
 fi
 if [[ "${{1:-}}" == "compose" ]]; then
   action=""
@@ -112,6 +139,10 @@ if [[ "${{1:-}}" == "compose" ]]; then
   done
   if [[ "$action" == "config" ]]; then exit {config_exit}; fi
   if [[ "$action" == "ps" ]]; then printf 'mock service status\n'; fi
+  exit 0
+fi
+if [[ "${{1:-}}" == "ps" ]]; then
+  printf '{label_projects}\n'
   exit 0
 fi
 if [[ "${{1:-}}" == "inspect" ]]; then
@@ -147,17 +178,68 @@ exit 99
         command.chmod(0o755)
         return command
 
-    def menu_env(self, *, docker=None, docker_present="true", os_release=None, ss=None, compose_source=None, getent=None):
+    def write_dpkg_query(self, *installed):
+        dpkg = self.tmp_path / "dpkg-query"
+        cases = "\n".join(f"    {pkg}) printf 'install ok installed' ; exit 0 ;;" for pkg in installed)
+        dpkg.write_text(f"""#!/usr/bin/env bash
+pkg="${{@: -1}}"
+case "$pkg" in
+{cases}
+esac
+exit 1
+""")
+        dpkg.chmod(0o755)
+        return dpkg
+
+    def write_nproc(self, cpus=4):
+        nproc = self.tmp_path / "nproc"
+        nproc.write_text(f"#!/usr/bin/env bash\nprintf '{cpus}\n'\n")
+        nproc.chmod(0o755)
+        return nproc
+
+    def write_df(self, available_gb=80):
+        df = self.tmp_path / "df"
+        available_kb = available_gb * 1024 * 1024
+        df.write_text(f"""#!/usr/bin/env bash
+printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
+printf '/dev/mock 104857600 1 {available_kb} 1%% /mock\n'
+""")
+        df.chmod(0o755)
+        return df
+
+    def write_meminfo(self, ram_gb=8):
+        meminfo = self.tmp_path / "meminfo"
+        meminfo.write_text(f"MemTotal:       {ram_gb * 1024 * 1024} kB\n")
+        return meminfo
+
+    def menu_env(
+        self,
+        *,
+        docker=None,
+        docker_present="true",
+        os_release=None,
+        ss=None,
+        compose_source=None,
+        getent=None,
+        dpkg_query=None,
+        nproc=None,
+        df=None,
+        meminfo=None,
+    ):
         compose_source = compose_source or self.write_compose()
         getent = getent or self.write_getent("#!/usr/bin/env bash\nexit 2\n")
         env = {
             "EASY_OPENVAS_BASE_DIR": str(self.tmp_path / "openvas"),
             "EASY_OPENVAS_COMPOSE_SOURCE": str(compose_source),
+            "EASY_OPENVAS_DF_CMD": str(df or self.write_df()),
             "EASY_OPENVAS_DOCKER_CMD": str(docker or self.write_docker()),
             "EASY_OPENVAS_DOCKER_PRESENT": docker_present,
+            "EASY_OPENVAS_DPKG_QUERY_CMD": str(dpkg_query or self.write_dpkg_query()),
             "EASY_OPENVAS_GETENT_CMD": str(getent),
             "EASY_OPENVAS_HEALTH_MAX_ATTEMPTS": "1",
             "EASY_OPENVAS_HEALTH_SLEEP_SECONDS": "0",
+            "EASY_OPENVAS_MEMINFO": str(meminfo or self.write_meminfo()),
+            "EASY_OPENVAS_NPROC_CMD": str(nproc or self.write_nproc()),
             "EASY_OPENVAS_OS_RELEASE": str(os_release or self.write_os_release()),
             "EASY_OPENVAS_SERVER_FQDN": "docker01.client.fr",
             "EASY_OPENVAS_SERVER_IP": "192.0.2.25",
@@ -345,6 +427,7 @@ exit 2
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("[OK] Debian 13 detected", result.stdout)
         self.assertIn("[OK] No existing Docker installation detected", result.stdout)
+        self.assertIn("[OK] No conflicting Docker CE packages detected", result.stdout)
         self.assertIn("[INFO] Installing Docker for Easy-OpenVAS...", result.stdout)
         docker_log = (self.tmp_path / "docker.log").read_text()
         self.assertIn("compose -f", docker_log)
@@ -378,6 +461,35 @@ exit 2
         docker_log = (self.tmp_path / "docker.log").read_text()
         self.assertEqual(docker_log, "info\n")
 
+    def test_fresh_mode_rejects_conflicting_docker_ce_packages_non_destructively(self):
+        for package in ("containerd", "runc", "podman-docker"):
+            with self.subTest(package=package):
+                dpkg = self.write_dpkg_query(package)
+                docker = self.write_docker()
+                result = self.run_installer(
+                    "menu",
+                    env=self.menu_env(docker=docker, docker_present="false", dpkg_query=dpkg),
+                    input_text="1\n3\n",
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("[ERROR] Conflicting container packages were detected:", result.stderr)
+                self.assertIn(f"  {package}", result.stderr)
+                self.assertIn("[INFO] Easy-OpenVAS will not remove existing container software automatically.", result.stdout)
+                self.assertIn("[INFO] No existing container software has been modified.", result.stdout)
+                self.assertFalse((self.tmp_path / "docker.log").exists())
+
+    def test_fresh_mode_does_not_block_podman_command_without_package_conflict(self):
+        podman = self.tmp_path / "podman"
+        podman.write_text("#!/usr/bin/env bash\nexit 0\n")
+        podman.chmod(0o755)
+        docker = self.write_docker()
+        env = self.menu_env(docker=docker, docker_present="false")
+        env["PATH"] = f"{self.tmp_path}:{os.environ['PATH']}"
+        result = self.run_installer("menu", env=env, input_text="1\n\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("[OK] No conflicting Docker CE packages detected", result.stdout)
+        self.assertIn("Installation completed", result.stdout)
+
     def test_existing_docker_mode_requires_docker(self):
         result = self.run_installer("menu", env=self.menu_env(docker_present="false"), input_text="2\n3\n")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -400,10 +512,67 @@ exit 2
     def test_existing_docker_mode_allows_non_debian_when_docker_is_ready(self):
         docker = self.write_docker()
         ubuntu = self.write_os_release(os_id="ubuntu", version_id="24.04", codename="noble")
-        result = self.run_installer("menu", env=self.menu_env(docker=docker, os_release=ubuntu), input_text="2\n\n")
+        result = self.run_installer("menu", env=self.menu_env(docker=docker, os_release=ubuntu), input_text="2\ny\n\n")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("[INFO] Existing Docker installation will be used unchanged.", result.stdout)
+        self.assertIn("Existing Docker preflight", result.stdout)
+        self.assertIn("[OK] Local Docker endpoint", result.stdout)
+        self.assertIn("[OK] No existing Greenbone project detected", result.stdout)
+        self.assertIn("[OK] Resource checks completed", result.stdout)
+        self.assertIn("Deploy Easy-OpenVAS on this Docker server? [y/N]:", result.stdout)
         self.assertIn("Installation completed", result.stdout)
+
+    def test_existing_docker_mode_rejects_remote_docker_host(self):
+        docker = self.write_docker()
+        env = self.menu_env(docker=docker)
+        env["DOCKER_HOST"] = "tcp://docker.example.com:2376"
+        result = self.run_installer("menu", env=env, input_text="2\n3\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("[ERROR] The active Docker context points to a remote Docker daemon.", result.stderr)
+        self.assertFalse((self.tmp_path / "openvas" / "compose.yaml").exists())
+
+    def test_existing_docker_mode_rejects_remote_context(self):
+        docker = self.write_docker(context_show="remote", context_endpoint="ssh://docker.example.com")
+        result = self.run_installer("menu", env=self.menu_env(docker=docker), input_text="2\n3\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("[ERROR] The active Docker context points to a remote Docker daemon.", result.stderr)
+        self.assertFalse((self.tmp_path / "openvas" / "compose.yaml").exists())
+
+    def test_existing_docker_mode_rejects_existing_greenbone_project(self):
+        for kwargs in ({"compose_projects": "greenbone-community-edition"}, {"label_projects": "openvas"}):
+            with self.subTest(kwargs=kwargs):
+                docker = self.write_docker(**kwargs)
+                result = self.run_installer("menu", env=self.menu_env(docker=docker), input_text="2\n3\n")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("[ERROR] An existing Greenbone/OpenVAS Docker project was detected.", result.stderr)
+                self.assertIn("[INFO] Existing containers, volumes and networks have not been modified.", result.stdout)
+                self.assertFalse((self.tmp_path / "openvas" / "compose.yaml").exists())
+
+    def test_existing_docker_preflight_cancels_by_default(self):
+        docker = self.write_docker()
+        result = self.run_installer("menu", env=self.menu_env(docker=docker), input_text="2\n\n3\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Deploy Easy-OpenVAS on this Docker server? [y/N]:", result.stdout)
+        self.assertIn("[INFO] Deployment cancelled.", result.stdout)
+        self.assertIn("[INFO] Existing Docker environment has not been modified.", result.stdout)
+        self.assertFalse((self.tmp_path / "openvas" / "compose.yaml").exists())
+
+    def test_resource_checks_fail_below_minimum_and_warn_below_recommended(self):
+        low = self.run_installer(
+            "resources",
+            "existing",
+            env=self.menu_env(nproc=self.write_nproc(1), meminfo=self.write_meminfo(2), df=self.write_df(10)),
+        )
+        self.assertNotEqual(low.returncode, 0)
+        self.assertIn("[ERROR] Insufficient system resources for Greenbone deployment.", low.stderr)
+
+        warned = self.run_installer(
+            "resources",
+            "existing",
+            env=self.menu_env(nproc=self.write_nproc(2), meminfo=self.write_meminfo(4), df=self.write_df(20)),
+        )
+        self.assertEqual(warned.returncode, 0, warned.stderr)
+        self.assertIn("[WARNING] Available resources are below Greenbone recommended values.", warned.stdout)
+        self.assertIn("[OK] Resource checks completed", warned.stdout)
 
     def test_port_checks_stop_before_deployment(self):
         for port in (443, 9392):
@@ -429,13 +598,34 @@ exit 2
         self.assertIn("[ERROR] An existing Easy-OpenVAS installation was detected", result.stderr)
         self.assertEqual(existing.read_text(), "existing compose\n")
 
+    def test_installer_contains_no_automatic_destructive_remediation(self):
+        script = SCRIPT.read_text()
+        forbidden = [
+            "apt remove",
+            "apt purge",
+            "apt autoremove",
+            "systemctl stop docker",
+            "systemctl restart docker",
+            "docker system prune",
+            "docker container prune",
+            "docker image prune",
+            "docker volume prune",
+            "docker network prune",
+            "docker compose down -v",
+            "docker stop",
+            "docker rm",
+        ]
+        for command in forbidden:
+            with self.subTest(command=command):
+                self.assertNotIn(command, script)
+
     def test_existing_docker_mode_does_not_run_destructive_commands(self):
         docker = self.write_docker()
         for name in ("apt", "systemctl"):
             self.write_forbidden_command(name)
         env = self.menu_env(docker=docker)
         env["PATH"] = f"{self.tmp_path}:{os.environ['PATH']}"
-        result = self.run_installer("menu", env=env, input_text="2\n\n")
+        result = self.run_installer("menu", env=env, input_text="2\ny\n\n")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((self.tmp_path / "forbidden.log").exists())
         docker_log = (self.tmp_path / "docker.log").read_text()

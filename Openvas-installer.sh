@@ -22,6 +22,10 @@ OPENVAS_DIR="${EASY_OPENVAS_BASE_DIR:-/opt/openvas}"
 COMPOSE_FILE="${EASY_OPENVAS_COMPOSE_FILE:-$OPENVAS_DIR/compose.yaml}"
 OS_RELEASE_FILE="${EASY_OPENVAS_OS_RELEASE:-/etc/os-release}"
 SS_CMD="${EASY_OPENVAS_SS_CMD:-ss}"
+DPKG_QUERY_CMD="${EASY_OPENVAS_DPKG_QUERY_CMD:-dpkg-query}"
+NPROC_CMD="${EASY_OPENVAS_NPROC_CMD:-nproc}"
+DF_CMD="${EASY_OPENVAS_DF_CMD:-df}"
+MEMINFO_FILE="${EASY_OPENVAS_MEMINFO:-/proc/meminfo}"
 SKIP_ROOT_CHECK="${EASY_OPENVAS_SKIP_ROOT:-false}"
 
 ok() { echo "[OK] $*"; }
@@ -217,6 +221,172 @@ docker_compose_available() {
   "$DOCKER_CMD" compose version >/dev/null 2>&1
 }
 
+# Detect Docker CE package conflicts without resolving them automatically.
+# Package removal remains an explicit administrator decision.
+conflicting_docker_packages() {
+  local PKG STATUS
+  for PKG in docker.io docker-doc docker-compose podman-docker containerd runc; do
+    STATUS="$($DPKG_QUERY_CMD -W -f='${Status}' "$PKG" 2>/dev/null || true)"
+    if [ "$STATUS" = "install ok installed" ]; then
+      printf '%s\n' "$PKG"
+    fi
+  done
+}
+
+# Never remove existing container runtimes automatically.
+# They may belong to unrelated workloads managed by the customer.
+check_no_conflicting_docker_packages_for_fresh() {
+  local CONFLICTS
+  CONFLICTS="$(conflicting_docker_packages)"
+  if [ -z "$CONFLICTS" ]; then
+    ok "No conflicting Docker CE packages detected"
+    return 0
+  fi
+
+  error "Conflicting container packages were detected:"
+  echo "" >&2
+  printf '%s\n' "$CONFLICTS" | while IFS= read -r PKG; do
+    [ -n "$PKG" ] && printf '  %s\n' "$PKG" >&2
+  done
+  echo "" >&2
+  info "Easy-OpenVAS will not remove existing container software automatically."
+  info "Review the server configuration and resolve the Docker package conflict manually."
+  info "No existing container software has been modified."
+  return 1
+}
+
+# Reject explicitly remote Docker endpoints without changing Docker context.
+# Easy-OpenVAS deploys only to the intended local Docker daemon.
+check_local_docker_endpoint() {
+  local CONTEXT ENDPOINT
+  if [[ "${DOCKER_HOST:-}" == tcp://* || "${DOCKER_HOST:-}" == ssh://* ]]; then
+    error "The active Docker context points to a remote Docker daemon."
+    error "Easy-OpenVAS will not deploy automatically to a remote Docker endpoint."
+    info "Select the intended local Docker context and run the installer again."
+    return 1
+  fi
+
+  CONTEXT="$($DOCKER_CMD context show 2>/dev/null || true)"
+  if [ -n "$CONTEXT" ]; then
+    ENDPOINT="$($DOCKER_CMD context inspect "$CONTEXT" --format '{{.Endpoints.docker.Host}}' 2>/dev/null || true)"
+    if [[ "$ENDPOINT" == tcp://* || "$ENDPOINT" == ssh://* ]]; then
+      error "The active Docker context points to a remote Docker daemon."
+      error "Easy-OpenVAS will not deploy automatically to a remote Docker endpoint."
+      info "Select the intended local Docker context and run the installer again."
+      return 1
+    fi
+  fi
+
+  ok "Local Docker endpoint"
+}
+
+# Detect existing Greenbone/OpenVAS Compose projects without modifying them.
+# Collisions are left for the administrator to resolve manually.
+check_no_existing_greenbone_project() {
+  local PROJECTS LABELS COMBINED LINE LOWER
+  PROJECTS="$($DOCKER_CMD compose ls --format '{{.Name}}' 2>/dev/null || true)"
+  LABELS="$($DOCKER_CMD ps -a --filter label=com.docker.compose.project --format '{{.Label "com.docker.compose.project"}}' 2>/dev/null || true)"
+  COMBINED="$(printf '%s\n%s\n' "$PROJECTS" "$LABELS")"
+  while IFS= read -r LINE; do
+    LOWER="${LINE,,}"
+    if [[ "$LOWER" == *greenbone* || "$LOWER" == *openvas* ]]; then
+      error "An existing Greenbone/OpenVAS Docker project was detected."
+      info "Existing containers, volumes and networks have not been modified."
+      return 1
+    fi
+  done <<< "$COMBINED"
+
+  ok "No existing Greenbone project detected"
+}
+
+# Resolve the filesystem that should be checked for OpenVAS data growth.
+# Existing Docker hosts use DockerRootDir when Docker can report it.
+disk_check_path() {
+  local ROOT
+  ROOT="$($DOCKER_CMD info --format '{{.DockerRootDir}}' 2>/dev/null || true)"
+  if [ -n "$ROOT" ]; then
+    printf '%s' "$ROOT"
+  else
+    printf '%s' "$OPENVAS_DIR"
+  fi
+}
+
+# Perform simple capacity checks without changing resource limits.
+# Greenbone feed data, databases, and scans can be heavy on shared hosts.
+check_system_resources() {
+  local MODE="$1" CPU RAM_KB RAM_GB DISK_PATH DISK_KB DISK_GB BELOW_MIN=0 BELOW_RECOMMENDED=0
+  CPU="$($NPROC_CMD 2>/dev/null || echo 0)"
+  RAM_KB="$(awk '/^MemTotal:/ { print $2; exit }' "$MEMINFO_FILE" 2>/dev/null || echo 0)"
+  RAM_GB=$((RAM_KB / 1024 / 1024))
+  if [ "$MODE" = "existing" ]; then
+    DISK_PATH="$(disk_check_path)"
+  else
+    DISK_PATH="$OPENVAS_DIR"
+  fi
+  if [ ! -e "$DISK_PATH" ]; then
+    DISK_PATH="$(dirname "$DISK_PATH")"
+  fi
+  DISK_KB="$($DF_CMD -Pk "$DISK_PATH" 2>/dev/null | awk 'NR==2 { print $4 }')"
+  DISK_GB=$(( ${DISK_KB:-0} / 1024 / 1024 ))
+
+  [ "${CPU:-0}" -lt 2 ] && BELOW_MIN=1
+  [ "$RAM_GB" -lt 4 ] && BELOW_MIN=1
+  [ "$DISK_GB" -lt 20 ] && BELOW_MIN=1
+  [ "${CPU:-0}" -lt 4 ] && BELOW_RECOMMENDED=1
+  [ "$RAM_GB" -lt 8 ] && BELOW_RECOMMENDED=1
+  [ "$DISK_GB" -lt 60 ] && BELOW_RECOMMENDED=1
+
+  if [ "$BELOW_MIN" -ne 0 ]; then
+    error "Insufficient system resources for Greenbone deployment."
+    return 1
+  fi
+  if [ "$BELOW_RECOMMENDED" -ne 0 ]; then
+    warning "Available resources are below Greenbone recommended values."
+  fi
+  if [ "$MODE" = "existing" ]; then
+    warning "OpenVAS feeds, databases and scan activity can consume significant disk and memory resources."
+    info "Ensure sufficient capacity remains available for existing Docker workloads."
+  fi
+  ok "Resource checks completed"
+}
+
+# Ask for explicit consent before deploying onto a shared Docker server.
+confirm_existing_docker_deployment() {
+  local ANSWER
+  printf 'Deploy Easy-OpenVAS on this Docker server? [y/N]:\n> '
+  if ! IFS= read -r ANSWER; then
+    info "Deployment cancelled."
+    info "Existing Docker environment has not been modified."
+    return 1
+  fi
+  case "$ANSWER" in
+    y|Y|yes|YES) return 0 ;;
+    *)
+      info "Deployment cancelled."
+      info "Existing Docker environment has not been modified."
+      return 1
+      ;;
+  esac
+}
+
+# Run all shared-host checks before downloading Compose files or creating data.
+existing_docker_preflight() {
+  echo "Existing Docker preflight"
+  echo ""
+  check_existing_docker_environment || return 1
+  check_local_docker_endpoint || return 1
+  check_no_existing_greenbone_project || return 1
+  check_no_existing_openvas_installation || return 1
+  ok "$OPENVAS_DIR available"
+  check_required_ports || return 1
+  check_system_resources existing || return 1
+  warning "The Greenbone scanner uses elevated container capabilities required by the upstream stack."
+  info "Review this deployment if the Docker host also runs sensitive unrelated workloads."
+  warning "OpenVAS can consume significant disk and memory resources."
+  echo ""
+  confirm_existing_docker_deployment
+}
+
 # Fresh-server installation is intentionally limited to Debian 13.
 # Existing Docker deployments are validated through Docker capabilities
 # rather than the underlying Linux distribution.
@@ -353,13 +523,8 @@ install_docker() {
   echo "Prerequisites installed."
   echo ""
 
-  echo "[3/9] Removing conflicting Docker packages if present..."
-
-  for pkg in docker.io docker-doc docker-compose podman-docker containerd runc; do
-    apt remove -y "$pkg" || true
-  done
-
-  echo "Conflicting packages removed or not present."
+  echo "[3/9] Verifying Docker CE package prerequisites..."
+  check_no_conflicting_docker_packages_for_fresh
   echo ""
 
   echo "[4/9] Installing Docker repository key..."
@@ -642,10 +807,14 @@ print_completion() {
 # Run the common OpenVAS deployment sequence after the selected mode has
 # completed its own safety checks.
 deploy_openvas_stack() {
+  local MODE="${1:-fresh}"
   detect_server_identity
   select_openvas_fqdn
-  check_required_ports || return 1
-  check_no_existing_openvas_installation || return 1
+  if [ "$MODE" != "existing" ]; then
+    check_no_existing_openvas_installation || return 1
+    check_required_ports || return 1
+    check_system_resources fresh || return 1
+  fi
   prepare_openvas_directory
   download_compose_file
   configure_openvas_compose
@@ -658,15 +827,18 @@ deploy_openvas_stack() {
 install_fresh_debian13_server() {
   check_fresh_debian13 || return 1
   ensure_no_existing_docker_for_fresh || return 1
+  check_no_existing_openvas_installation || return 1
+  check_no_conflicting_docker_packages_for_fresh || return 1
+  check_system_resources fresh || return 1
   install_docker
-  deploy_openvas_stack
+  deploy_openvas_stack fresh
 }
 
 # Existing Docker mode validates Docker capabilities and then deploys only the
 # Easy-OpenVAS Greenbone stack.
 install_existing_docker_server() {
-  check_existing_docker_environment || return 1
-  deploy_openvas_stack
+  existing_docker_preflight || return 1
+  deploy_openvas_stack existing
 }
 
 # Show the interactive deployment menu.
@@ -729,6 +901,10 @@ run_test_command() {
       COMPOSE_FILE="$1"
       validate_docker_compose_config
       ;;
+    fresh-conflicts) check_no_conflicting_docker_packages_for_fresh ;;
+    local-docker) check_local_docker_endpoint ;;
+    greenbone-project) check_no_existing_greenbone_project ;;
+    resources) check_system_resources "${1:-fresh}" ;;
     menu) main_menu ;;
     *) error "Unknown test command."; return 2 ;;
   esac
