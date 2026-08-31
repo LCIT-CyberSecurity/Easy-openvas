@@ -1,16 +1,36 @@
 # Easy-openvas
 
-Setup a full OpenVAS service easily on a Debian host with Docker.
+Setup a full OpenVAS service easily with Docker.
 
 ## Prerequisites
 
-- A Debian 13 machine.
 - A user account with sudo privileges.
 - Recommended CPU: 2 vCPU minimum, 4 vCPU for a comfortable experience.
 - Recommended RAM: 8 GB minimum, 12 GB or more for a comfortable experience.
 - Recommended disk space: at least 100 GB free.
 - A stable internet connection for Docker image downloads and vulnerability feed synchronization.
 - Network access to the targets you want to scan.
+
+Easy-OpenVAS can be deployed in two ways:
+
+1. Fresh Debian 13 server
+   Easy-OpenVAS installs Docker automatically. This mode currently targets Debian 13 (Trixie).
+2. Existing Docker server
+   Easy-OpenVAS reuses the existing Docker installation.
+
+Easy-OpenVAS never automatically removes existing container runtimes or container-management software. If conflicting packages prevent Docker CE installation in Fresh Debian mode, the installer stops and asks the administrator to resolve the conflict manually.
+
+For an existing Docker server, the prerequisites are:
+
+- Docker daemon operational.
+- Docker Compose v2 available through `docker compose`.
+- Active Docker endpoint must be local, not a remote `tcp://` or `ssh://` context.
+- No existing Easy-OpenVAS installation in `/opt/openvas`.
+- No existing Greenbone/OpenVAS Docker Compose project detected.
+- TCP ports `443` and `9392` available.
+- Basic CPU, RAM, and disk capacity checks pass.
+
+When using an existing Docker server, Easy-OpenVAS reuses Docker as-is. It does not install, uninstall, upgrade, reconfigure, restart or otherwise manage the Docker daemon, and it does not stop or modify existing containers, volumes, networks or workloads. The installer checks for port conflicts, Greenbone project collisions, local Docker context, and available resources before asking for explicit deployment confirmation.
 
 ## Official documentation
 
@@ -23,7 +43,7 @@ The official OpenVAS / Greenbone Community Containers documentation is available
 On the Debian 13 machine, either clone this repository:
 
 ```bash
-git clone https://github.com/cedricdicesare/Easy-openvas.git
+git clone https://github.com/LCIT-CyberSecurity/Easy-openvas.git
 cd Easy-openvas
 ```
 
@@ -45,7 +65,15 @@ Run the installer with sudo:
 sudo ./Openvas-installer.sh
 ```
 
-The script installs Docker, downloads the OpenVAS Docker Compose file, starts the containers, and prints the access information at the end.
+The installer displays a menu:
+
+```text
+1. Install OpenVAS on a fresh Debian 13 server
+2. Install OpenVAS on an existing Docker server
+3. Exit
+```
+
+Option 1 checks that the system is Debian 13 and that Docker is not already installed before installing Docker. Option 2 checks the existing Docker environment and then deploys only the Easy-OpenVAS Greenbone/OpenVAS stack.
 
 ## Updating Docker images without losing data
 
@@ -76,21 +104,73 @@ sudo docker system prune --volumes
 
 The `-v` and `--volumes` options remove Docker volumes. Removing volumes can delete OpenVAS configuration, scan tasks, reports, and database content.
 
+## OpenVAS service FQDN
+
+Easy-OpenVAS distinguishes the Debian/Docker host name from the OpenVAS service FQDN used by administrators and users.
+
+Example:
+
+```text
+Docker / Linux host: docker01.example.com
+OpenVAS service:    openvas.example.com
+```
+
+During installation, the script detects the host FQDN and, when it contains a usable domain, proposes `openvas.<domain>`:
+
+```text
+docker01.example.com
+-> proposed OpenVAS FQDN: openvas.example.com
+```
+
+The installer then asks:
+
+```text
+OpenVAS FQDN [openvas.example.com]:
+>
+```
+
+Press Enter to accept the proposed value, or enter the full FQDN you want to use, for example:
+
+```text
+openvas.example.com
+scan.example.com
+scan.security.example.com
+host.domain.example
+```
+
+The `openvas.` prefix is only a default proposal. It is not mandatory.
+
+The chosen FQDN should normally have a DNS entry that lets users reach the OpenVAS service. The installer performs an informational DNS check:
+
+```text
+[OK] DNS name openvas.example.com resolves to 192.168.1.25
+```
+
+If the DNS entry does not exist yet, installation continues:
+
+```text
+[WARNING] DNS name openvas.example.com does not currently resolve.
+[WARNING] Create or verify the DNS entry before accessing OpenVAS with this name.
+```
+
+The DNS entry can be created before or after installation.
+
 ## Web interface URL
 
 After installation, the OpenVAS web interface is available at:
 
 ```text
-https://<server-fqdn>
+https://<openvas-fqdn>
 ```
 
-If the server FQDN is not available or not resolvable from your browser, use the server IP address instead:
+Examples:
 
 ```text
-https://<server-ip>
+https://openvas.example.com
+https://scan.security.example.com
 ```
 
-The installer configures the OpenVAS web service to listen on all network interfaces. This means the interface can be reached through any IP address assigned to the Debian server, as long as the network and firewall allow access to port `443`.
+The installer configures Greenbone nginx for the OpenVAS FQDN selected during installation. The server IP address is useful for diagnostics, but the recommended access URL is the OpenVAS FQDN.
 
 ## Port
 
@@ -99,7 +179,7 @@ No port needs to be added to the URL with the default OpenVAS Docker Compose con
 HTTPS uses the standard port `443`, so this is enough:
 
 ```text
-https://<server-fqdn>
+https://<openvas-fqdn>
 ```
 
 Only specify a port if you changed the Docker Compose port mapping manually. In the default OpenVAS Compose file, port `9392` redirects to `443`.
@@ -142,7 +222,53 @@ sudo ufw allow from 192.168.1.0/24 to any port 443 proto tcp
 
 The default OpenVAS container setup uses a self-signed HTTPS certificate. Browsers will usually display a security warning for this certificate.
 
-For production usage, or to avoid browser warnings, install a TLS certificate issued by a certificate authority trusted by browsers.
+To avoid browser warnings, install a TLS certificate issued by a certificate authority trusted by browsers.
+
+## Managing the HTTPS certificate
+
+After Easy-OpenVAS has already been installed, the HTTPS certificate can be managed without reinstalling OpenVAS:
+
+```bash
+sudo ./certificate-installer.sh
+```
+
+By default, Easy-OpenVAS keeps the Greenbone self-signed certificate generated by the Greenbone containers.
+
+A custom certificate must cover the OpenVAS FQDN actually used by the service in its DNS Subject Alternative Name.
+
+Example:
+
+```text
+OpenVAS FQDN:
+openvas.example.com
+
+Certificate SAN:
+DNS:openvas.example.com
+```
+
+To use an enterprise or publicly trusted certificate, choose:
+
+```text
+1. Install / replace custom certificate
+```
+
+The administrator only has to provide:
+
+```text
+Certificate / fullchain path
+Private key path
+OpenVAS FQDN
+```
+
+The script asks for the certificate or fullchain path, the private key path, and the OpenVAS FQDN. It validates the certificate, validates the private key, checks that they match, verifies that the certificate covers the OpenVAS FQDN, copies the files to `/opt/openvas/certs/`, applies secure permissions, updates the Greenbone nginx TLS configuration, and verifies the certificate actually presented by NGINX over HTTPS.
+
+When the installation completes successfully, the original source certificate and key files provided by the administrator are no longer required by Easy-OpenVAS and may be removed by the administrator.
+
+The same script can also:
+
+- show the currently presented HTTPS certificate;
+- replace an existing custom certificate with a new one;
+- restore the original Greenbone self-signed certificate.
 
 ## Default credentials
 
